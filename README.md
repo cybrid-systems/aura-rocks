@@ -58,6 +58,20 @@ Decisions in the last policy run:
 - KEEP for 12 kernels, from rk-entry-encode at 2.2× up to rk-sst-merge at 2611×.
 - ROLLBACK for rk-hash, rk-dec and rk-bloom-may (≈1×): about 100 µs of Soft work per call, while the host-slot entry costs about 60 µs over the raw c-func.
 
+### vs RocksDB ([docs/vs-rocksdb.md](docs/vs-rocksdb.md), 2026-10-16)
+
+Apples-to-apples against RocksDB 9.10.0 `db_bench` on the same box. The options match: 16 B keys, 100 B values, 64 KB memtable, L0 trigger 4, 10 bloom bits, WAL on without fsync, no compression, no block cache, 1 thread. Medians in µs/op at N=2000:
+
+| workload | RocksDB | aura-rocks pure | aura-rocks sink | sink/RocksDB |
+|---|---:|---:|---:|---:|
+| fillseq | 4.8 | 15,482 | 12,752 | 2,633× |
+| fillrandom | 5.7 | 15,484 | 12,718 | 2,225× |
+| readrandom | 2.5 | 31,144 | 11,656 | 4,658× |
+| readseq | 0.31 | 8,958 | 1,926 | 6,231× |
+| readmissing | 0.50 | 10,868 | 10,124 | 20,088× |
+
+The remaining cost is interpreter-resident: the Aura skiplist memtable (about 4.5 ms per put), the observer (about 2 ms per op), the db layer's per-op glue, and `substring` cost that grows with string length (aura#4548). It is not the byte work the kernels already sink. The doc has the N=20000 numbers and a per-op breakdown.
+
 ### Benchmarks ([docs/bench.md](docs/bench.md), 2026-10-16, before = b3d934c)
 
 | | before (Soft) | before (vkgen sink) | after (kept kernels) |

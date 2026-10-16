@@ -1,0 +1,48 @@
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"total","us":14861.5}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"interpreter loop","us":35.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"key build (bench harness)","us":774.5}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"WAL append (record encode + write(2))","us":1995.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"memtable insert (skiplist)","us":4303.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"observer (obs:put!)","us":1843.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"flush, amortized (mem:entries + SST build + open + manifest)","us":0.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"compaction, amortized","us":0.0}
+{"tag":"pure","n":2000,"op":"fillrandom","piece":"other","us":5911.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"total","us":29134.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"interpreter loop","us":35.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"key build (bench harness)","us":898.5}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"memtable lookup (empty after flush)","us":777.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"table lookups: range + bloom + index + block read/verify + block-get","us":21264.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"  of which bloom check (hash + probes, Soft)","us":477.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"observer (obs:get!)","us":1935.0}
+{"tag":"pure","n":2000,"op":"readrandom","piece":"other (level walk, stats, glue)","us":4224.5}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"total","us":10331.0}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"interpreter loop","us":35.0}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"key build (bench harness)","us":1146.0}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"table lookups (range + bloom negative per table)","us":1656.0}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"observer (obs:get!)","us":1935.0}
+{"tag":"pure","n":2000,"op":"readmissing","piece":"other (memtable, level walk, stats, glue)","us":5559.0}
+{"tag":"pure","n":2000,"op":"readseq","piece":"total (per entry)","us":8378.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"total","us":12716.5}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"interpreter loop","us":34.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"key build (bench harness)","us":682.5}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"WAL append (record encode + write(2))","us":1030.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"memtable insert (skiplist)","us":4270.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"observer (obs:put!)","us":1874.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"flush, amortized (mem:entries + SST build + open + manifest)","us":0.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"compaction, amortized","us":0.0}
+{"tag":"sink","n":2000,"op":"fillrandom","piece":"other","us":4826.0}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"total","us":11541.5}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"interpreter loop","us":34.0}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"key build (bench harness)","us":774.0}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"memtable lookup (empty after flush)","us":739.0}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"table lookups: range + bloom + index + block read/verify + block-get","us":2841.5}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"  of which bloom check (hash + probes, Soft)","us":468.5}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"observer (obs:get!)","us":1812.0}
+{"tag":"sink","n":2000,"op":"readrandom","piece":"other (level walk, stats, glue)","us":5341.0}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"total","us":9954.5}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"interpreter loop","us":34.0}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"key build (bench harness)","us":1021.5}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"table lookups (range + bloom negative per table)","us":1307.0}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"observer (obs:get!)","us":1812.0}
+{"tag":"sink","n":2000,"op":"readmissing","piece":"other (memtable, level walk, stats, glue)","us":5780.0}
+{"tag":"sink","n":2000,"op":"readseq","piece":"total (per entry)","us":1845.0}
