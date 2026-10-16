@@ -12,7 +12,7 @@
 ; mmap) and verifies a data block's checksum each time it reads the block
 ; (no block cache in the MVP).
 ;
-; t  = #(path data idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size uid)
+; t  = #(path raws idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size uid data)
 ;
 ; Optional process-wide block cache (lib/cache.aura, sst:set-cache!): a
 ; verified block is cached under "<uid>#<block>", uid unique per opened table,
@@ -20,7 +20,7 @@
 ; it = #(t bi block n ra ei)   (bi = nblocks: exhausted)
 (export sst:write sst:open sst:get sst:path sst:smallest sst:largest sst:count sst:size sst:nblocks
         sst:iter sst:iter-first! sst:iter-seek! sst:iter-valid? sst:iter-next! sst:iter-key sst:iter-type sst:iter-val
-        sst:block-bytes sst:stats sst:stats-reset! sst:set-cache! sst:cache)
+        sst:data sst:touch! sst:block-bytes sst:stats sst:stats-reset! sst:set-cache! sst:cache)
 (require "leaf" all:)
 (require "ru" all:)
 (require "rio" all:)
@@ -120,7 +120,7 @@
                     (each (+ i 1) (+ q 24 kl)))
                   #t))
             (vector path raws keys offs sizes nb (bloom:parse (substring fl 0 (- flt-size 10)))
-                    smallest largest count n (sst-next-uid!))))))))
+                    smallest largest count n (sst-next-uid!) data)))))))
 
 (define (sst:path t) (vector-ref t 0))
 (define (sst:nblocks t) (vector-ref t 5))
@@ -128,6 +128,8 @@
 (define (sst:largest t) (vector-ref t 8))
 (define (sst:count t) (vector-ref t 9))
 (define (sst:size t) (vector-ref t 10))
+; the file bytes (whole-table kernels: lib/db.aura scan)
+(define (sst:data t) (vector-ref t 12))
 
 ; first block whose last key >= key (nblocks if none)
 (define (sst-find-block t key)
@@ -150,6 +152,10 @@
                (hit (cache:get c k)))
           (if hit hit
               (let ((b (sst-block-read t i))) (cache:put! c k b) b))))))
+
+; blocks b0..b1 were read by a kernel: same block-cache traffic and
+; block_reads count as the iterator's reads
+(define (sst:touch! t b0 b1) (if (<= b0 b1) (begin (sst-block t b0) (sst:touch! t (+ b0 1) b1)) #t))
 
 ; #f, or (type . val) for key
 (define (sst:get t key use-bloom)

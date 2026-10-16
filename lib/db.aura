@@ -322,6 +322,38 @@
     (db-after-op! db)
     r))
 (define (db-scan db start end limit)
+  (let ((r (db-scan-k db start end limit))) (if r r (db-scan-soft db start end limit))))
+; one coarse kernel (ws/hot.aura rk-scan) over the memtable view and the
+; table bytes; the memtable gives entries until limit live ones (they are
+; newest, so the answer never needs a key past the last one); the blocks the
+; kernel read go through the block cache (sst:touch!). #f: no slot / refused.
+(define (db-scan-k db start end limit)
+  (if (not (leaf:scan-k "" "" "" 0 0)) #f
+      (let* ((c (mem:cursor (vector-ref db 1)))
+             (seek (mem:cur-seek! c start))
+             (mb (let loop ((n 0) (acc (list)))
+                   (if (or (not (mem:cur-valid? c)) (and limit (>= n limit)) (and end (not (string<? (mem:cur-key c) end))))
+                       (ru:concat (ru:rev acc))
+                       (let ((ty (mem:cur-type c)))
+                         (let ((e (entry:encode ty (mem:cur-key c) (mem:cur-val c))))
+                           (mem:cur-next! c)
+                           (loop (if (= ty entry:del) n (+ n 1)) (cons e acc)))))))
+             (ts (append (db:level-files db 0) (db:level-files db 1)))
+             (srcs (ru:concat (cons (ru:pad (+ 1 (string-length mb)) 12) (cons "M" (cons mb
+                     (let loop ((ts ts) (acc (list)))
+                       (if (null? ts) (ru:rev acc)
+                           (let ((d (sst:data (car ts)))) (loop (cdr ts) (cons d (cons "T" (cons (ru:pad (+ 1 (string-length d)) 12) acc))))))))))))
+             (r (leaf:scan-k srcs start (if end end "") (if end 1 0) (if limit limit -1))))
+        (if (not r) #f
+            (let touch ((ts ts) (q 0))
+              (if (not (null? ts))
+                  (begin (sst:touch! (car ts) (leaf:dec r q 8) (leaf:dec r (+ q 8) 8)) (touch (cdr ts) (+ q 16)))
+                  (let ((n (leaf:dec r q 8)))
+                    (let loop ((i 0) (off (+ q 8)) (acc (list)))
+                      (if (>= i n) (ru:rev acc)
+                          (let* ((kl (leaf:dec r off 4)) (vl (leaf:dec r (+ off 4) 6)) (k0 (+ off 10)))
+                            (loop (+ i 1) (+ k0 kl vl) (cons (cons (substring r k0 (+ k0 kl)) (substring r (+ k0 kl) (+ k0 kl vl))) acc))))))))))))
+(define (db-scan-soft db start end limit)
   (let ((mg (merge:seek! (merge:new (cons (merge:mem-source (vector-ref db 1))
                                           (let loop ((ts (append (db:level-files db 0) (db:level-files db 1))) (acc (list)))
                                             (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc))))))

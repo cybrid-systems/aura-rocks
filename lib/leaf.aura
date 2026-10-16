@@ -8,7 +8,7 @@
 ; tests/test_leaf.aura rebinds each leaf and checks every leaf:* follows it.
 (export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek
         leaf:pad leaf:entry-encode leaf:wal-record leaf:block-build leaf:bloom-build leaf:bloom-may leaf:block-get leaf:cache-sim
-        leaf:sst-build leaf:sst-build-k leaf:sst-merge leaf:sst-merge-k
+        leaf:sst-build leaf:sst-build-k leaf:sst-merge leaf:sst-merge-k leaf:scan leaf:scan-k
         leaf:memtable-rep leaf:compaction-style leaf:l0-trigger leaf:max-runs leaf:cache-policy leaf:bloom-reads
         leaf:install! leaf:installed leaf:uninstall-all!)
 (require "hot" all:)
@@ -92,6 +92,17 @@
       #f))
 (define (leaf:sst-merge files bottom target bb bpk)
   (let ((r (leaf:sst-merge-k files bottom target bb bpk))) (if r r (rk-sst-merge files bottom target bb bpk))))
+(define leaf-k-scan #f)
+(define (leaf:scan-k srcs start end has-end limit)
+  (if (and leaf-k-scan (string? srcs) (string? start) (string? end))
+      ; start and end packed into one String: c-func passes at most 6 arguments (aura#4553)
+      (let* ((sl (string-length start))
+             (keys (if (< sl 10000) (string-append (rk-pad sl 4) start end) #f))
+             (r (if keys (leaf-k-scan srcs (string-length srcs) keys (string-length keys) has-end limit) #f)))
+        (if (string? r) r #f))
+      #f))
+(define (leaf:scan srcs start end has-end limit)
+  (let ((r (leaf:scan-k srcs start end has-end limit))) (if r r (rk-scan srcs start end has-end limit))))
 
 (define (leaf:memtable-rep) (rk-memtable-rep))
 (define (leaf:compaction-style) (rk-compaction-style))
@@ -120,9 +131,10 @@
         ((equal? name "rk-cache-sim") (set! leaf-k-cache-sim k) #t)
         ((equal? name "rk-sst-build") (set! leaf-k-sst-build k) #t)
         ((equal? name "rk-sst-merge") (set! leaf-k-sst-merge k) #t)
+        ((equal? name "rk-scan") (set! leaf-k-scan k) #t)
         (else #f)))
 ; names whose slot holds a kernel
 (define (leaf:installed)
-  (let loop ((xs (list (cons "rk-checksum" leaf-k-checksum) (cons "rk-hash" leaf-k-hash) (cons "rk-dec" leaf-k-dec) (cons "rk-block-seek" leaf-k-block-seek) (cons "rk-pad" leaf-k-pad) (cons "rk-entry-encode" leaf-k-entry-encode) (cons "rk-wal-record" leaf-k-wal-record) (cons "rk-block-build" leaf-k-block-build) (cons "rk-bloom-build" leaf-k-bloom-build) (cons "rk-bloom-may" leaf-k-bloom-may) (cons "rk-block-get" leaf-k-block-get) (cons "rk-cache-sim" leaf-k-cache-sim) (cons "rk-sst-build" leaf-k-sst-build) (cons "rk-sst-merge" leaf-k-sst-merge))) (acc (list)))
+  (let loop ((xs (list (cons "rk-checksum" leaf-k-checksum) (cons "rk-hash" leaf-k-hash) (cons "rk-dec" leaf-k-dec) (cons "rk-block-seek" leaf-k-block-seek) (cons "rk-pad" leaf-k-pad) (cons "rk-entry-encode" leaf-k-entry-encode) (cons "rk-wal-record" leaf-k-wal-record) (cons "rk-block-build" leaf-k-block-build) (cons "rk-bloom-build" leaf-k-bloom-build) (cons "rk-bloom-may" leaf-k-bloom-may) (cons "rk-block-get" leaf-k-block-get) (cons "rk-cache-sim" leaf-k-cache-sim) (cons "rk-sst-build" leaf-k-sst-build) (cons "rk-sst-merge" leaf-k-sst-merge) (cons "rk-scan" leaf-k-scan))) (acc (list)))
     (cond ((null? xs) (reverse acc)) ((cdr (car xs)) (loop (cdr xs) (cons (car (car xs)) acc))) (else (loop (cdr xs) acc)))))
 (define (leaf:uninstall-all!) (for-each (lambda (n) (leaf:install! n #f)) (leaf:installed)) #t)

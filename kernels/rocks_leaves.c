@@ -557,3 +557,149 @@ done:
   free(fe); free(fn); free(outv); free(out.p);
   return res;
 }
+
+/* ---- range scan over the memtable view + SST files (lib/db.aura db-scan) ----
+ * srcs = { len(12) kind(1) bytes }* newest first; kind 'M' = encoded entries
+ * (sorted, >= start), kind 'T' = SST file bytes. Live entries with
+ * start <= key (< end when has_end), newest wins, at most limit (limit < 0:
+ * no limit). Result: per 'T' source b0(8) b1(8) (blocks read: b0 = seek
+ * block, b1 = block the cursor stands on at the end: like sst:iter-next! it
+ * loads the next block once it consumed a block's last entry; b1 < b0: none),
+ * then count(8), then { klen(4) vlen(6) key val }*. Block and index
+ * checksums are verified (refusal on mismatch). start and end arrive packed
+ * in one String (keys). */
+typedef struct {
+  int sst; const char *d; long dl;
+  const char *ix; long nb; long *bo, *bs; /* block offsets / sizes */
+  long bi; Ent *es; long n, pos; long b0, last; /* current block entries */
+  const char *mb; long ml, mo; Ent cur; int has;
+} Src;
+static int src_load_block(Src *s, long bi) {
+  free(s->es); s->es = NULL; s->n = 0; s->pos = 0; s->bi = bi;
+  if (bi >= s->nb) return 1;
+  const char *blk = s->d + s->bo[bi]; long bl = s->bs[bi] - 10;
+  if (bl < 6 || !digits(blk + bl, 10) || (uint64_t)dec(blk + bl, 10) != adler(blk, bl) || !digits(blk + bl - 6, 6)) return 0;
+  long cnt = dec(blk + bl - 6, 6), ra = bl - 6 - 6 * cnt;
+  if (ra < 0) return 0;
+  s->es = malloc(sizeof(Ent) * (size_t)(cnt + 1));
+  if (!s->es) return 0;
+  for (long e = 0; e < cnt; e++) {
+    if (!digits(blk + ra + 6 * e, 6)) return 0;
+    long eo = dec(blk + ra + 6 * e, 6);
+    if (eo + 11 > ra || !digits(blk + eo + 1, 10)) return 0;
+    long sz = 11 + dec(blk + eo + 1, 4) + dec(blk + eo + 5, 6);
+    if (eo + sz > ra) return 0;
+    s->es[e].e = blk + eo; s->es[e].el = sz;
+  }
+  s->n = cnt;
+  return 1;
+}
+/* position on the current entry (skipping exhausted blocks); 0 on corruption */
+static int src_settle(Src *s) {
+  if (!s->sst) {
+    s->has = 0;
+    if (s->mo >= s->ml) return 1;
+    if (s->mo + 11 > s->ml || !digits(s->mb + s->mo + 1, 10)) return 0;
+    long sz = 11 + dec(s->mb + s->mo + 1, 4) + dec(s->mb + s->mo + 5, 6);
+    if (s->mo + sz > s->ml) return 0;
+    s->cur.e = s->mb + s->mo; s->cur.el = sz; s->has = 1;
+    return 1;
+  }
+  while (s->bi < s->nb && s->pos >= s->n) if (!src_load_block(s, s->bi + 1)) return 0;
+  s->has = s->bi < s->nb;
+  if (s->has) s->cur = s->es[s->pos];
+  return 1;
+}
+static void src_next(Src *s) { if (s->sst) s->pos++; else s->mo += s->cur.el; }
+static int src_open_sst(Src *s, const char *start, long sl) {
+  const char *d = s->d; long dl = s->dl;
+  if (dl < 68 || memcmp(d + dl - 8, "AROCKS01", 8) != 0 || !digits(d + dl - 68, 60)) return 0;
+  long io = dec(d + dl - 68, 12), is = dec(d + dl - 56, 12);
+  if (io < 0 || is < 10 || io + is > dl) return 0;
+  const char *ix = d + io; long il = is - 10;
+  if (!digits(ix + il, 10) || (uint64_t)dec(ix + il, 10) != adler(ix, il)) return 0;
+  if (il < 4) return 0;
+  long q = 4 + dec(ix, 4); if (q + 4 > il) return 0;
+  q += 4 + dec(ix + q, 4); if (q + 8 > il) return 0;
+  long nb = dec(ix + q, 8); q += 8;
+  s->nb = nb; s->bo = malloc(sizeof(long) * (size_t)(nb + 1)); s->bs = malloc(sizeof(long) * (size_t)(nb + 1));
+  if (!s->bo || !s->bs) return 0;
+  long b0 = nb;
+  for (long bi = 0; bi < nb; bi++) {
+    if (q + 4 > il) return 0;
+    long kl = dec(ix + q, 4);
+    if (q + 24 + kl > il) return 0;
+    s->bo[bi] = dec(ix + q + 4 + kl, 12); s->bs[bi] = dec(ix + q + 16 + kl, 8);
+    if (s->bo[bi] < 0 || s->bs[bi] < 16 || s->bo[bi] + s->bs[bi] > io) return 0;
+    if (b0 == nb) { /* first block whose last key >= start */
+      int c = memcmp(ix + q + 4, start, (size_t)(kl < sl ? kl : sl));
+      if (c > 0 || (c == 0 && kl >= sl)) b0 = bi;
+    }
+    q += 24 + kl;
+  }
+  s->b0 = b0; s->last = b0;
+  if (!src_load_block(s, b0)) return 0;
+  /* lower bound within the block */
+  while (s->pos < s->n) {
+    const Ent *e = &s->es[s->pos]; long kl = EKL(e->e);
+    int c = memcmp(e->e + 11, start, (size_t)(kl < sl ? kl : sl));
+    if (c > 0 || (c == 0 && kl >= sl)) break;
+    s->pos++;
+  }
+  return 1;
+}
+/* keys = slen(4) start end: c-func passes at most 6 arguments (aura#4553) */
+AURA_SINK_EXPORT const char *rk_scan(const char *b, long bl, const char *keys, long kl, long has_end, long limit) {
+  if (!ascii_ok(b, bl) || !ascii_ok(keys, kl) || kl < 4 || !digits(keys, 4)) return NULL;
+  long sl = dec(keys, 4);
+  if (4 + sl > kl) return NULL;
+  const char *start = keys + 4, *end = keys + 4 + sl; long el = kl - 4 - sl;
+  long ns = 0, cap = 8; Src *ss = calloc((size_t)cap, sizeof(Src));
+  const char *res = NULL; Buf out = {0}, hdr = {0};
+  if (!ss) return NULL;
+  for (long off = 0; off < bl;) {
+    if (off + 13 > bl || !digits(b + off, 12)) goto done;
+    long len = dec(b + off, 12) - 1; char kind = b[off + 12];
+    if (len < 0 || off + 13 + len > bl || (kind != 'M' && kind != 'T')) goto done;
+    if (ns == cap) { Src *t = realloc(ss, sizeof(Src) * (size_t)cap * 2); if (!t) goto done; memset(t + cap, 0, sizeof(Src) * (size_t)cap); ss = t; cap *= 2; }
+    Src *s = &ss[ns++];
+    if (kind == 'T') { s->sst = 1; s->d = b + off + 13; s->dl = len; if (!src_open_sst(s, start, sl)) goto done; }
+    else { s->mb = b + off + 13; s->ml = len; }
+    if (!src_settle(s)) goto done;
+    off += 13 + len;
+  }
+  long cnt = 0;
+  while (limit < 0 || cnt < limit) {
+    long best = -1;
+    for (long i = 0; i < ns; i++)
+      if (ss[i].has && (best < 0 || key_cmp(&ss[i].cur, &ss[best].cur) < 0)) best = i;
+    if (best < 0) break;
+    Ent e = ss[best].cur;
+    for (long i = 0; i < ns; i++)
+      if (ss[i].has && key_cmp(&ss[i].cur, &e) == 0) {
+        if (ss[i].sst) ss[i].last = ss[i].bi;
+        src_next(&ss[i]);
+        if (!src_settle(&ss[i])) goto done;
+      }
+    long kl = EKL(e.e), vl = EVL(e.e);
+    if (has_end) {
+      int c = memcmp(e.e + 11, end, (size_t)(kl < el ? kl : el));
+      if (!(c < 0 || (c == 0 && kl < el))) break;
+    }
+    if (e.e[0] == 'D') continue;
+    bput(&out, e.e + 1, (size_t)(10 + kl + vl));
+    cnt++;
+  }
+  for (long i = 0; i < ns; i++)
+    if (ss[i].sst) { bdec(&hdr, (uint64_t)ss[i].b0, 8); bdec(&hdr, (uint64_t)(ss[i].b0 < ss[i].nb ? (ss[i].bi < ss[i].nb ? ss[i].bi : ss[i].nb - 1) : ss[i].b0 - 1), 8); }
+  bdec(&hdr, (uint64_t)cnt, 8);
+  if (out.bad || hdr.bad) goto done;
+  {
+    char *o = rbuf(hdr.n + out.n + 1);
+    if (o) { memcpy(o, hdr.p, hdr.n); if (out.n) memcpy(o + hdr.n, out.p, out.n); o[hdr.n + out.n] = 0; res = o; }
+  }
+done:
+  for (long i = 0; i < ns; i++) { free(ss[i].es); free(ss[i].bo); free(ss[i].bs); }
+  free(ss); free(out.p); free(hdr.p);
+  return res;
+}
