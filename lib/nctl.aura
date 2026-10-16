@@ -1,0 +1,361 @@
+; lib/nctl.aura — the Aura control plane of the native data plane.
+;
+; The data plane (lib/ndb.aura -> native/rk_native.c) does every op natively
+; and counts it in native atomics. This controller never sits on the op path:
+; the application calls (nctl:tick! ctl) every so often (cheap: one Aura
+; counter); every `window` ops it SAMPLES the native counters (one ndb:stats
+; call), derives the workload mix from the deltas, and decides:
+;
+;   memtable_rep      write share >= mem_write_hi: vector; scan share >=
+;                     mem_scan_hi: skiplist; point reads >= mem_read_hi with
+;                     few scans: hash; else skiplist. Applied natively at the
+;                     next memtable rotation (the safe point).
+;   compaction_style  write share >= cmp_write_hi: tiered (l0_trigger_write);
+;                     reads+scans >= cmp_read_hi: leveled (l0_trigger_read; the
+;                     switch merges the runs into one, natively)
+;   cache_policy      (when a block cache is configured) scans >= mem_scan_hi:
+;                     clock; skewed point reads (hit rate >= 0.5): lfu; else lru
+;   bloom_bits        miss rate >= bloom_hi_miss: bloom_bits_hi for new tables
+;   implementation    nctl:swap-impl!: a candidate native build (another .so of
+;                     rk_native.c: version / flags) is gated with a randomized
+;                     model test against the pure-Aura reference engine
+;                     (lib/db.aura), swapped at a memtable rotation (flush ->
+;                     close in the old .so -> reopen the same files in the new
+;                     one; MANIFEST + SSTs are the transferred state), and post
+;                     checked: native ns/op over the next windows vs before ->
+;                     KEEP, or ROLLBACK (swap back the same way).
+;
+; Cost metric: native time per op (write_ns + read_ns + scan_ns deltas, the
+; db opened with time_ops=1), so the Aura harness around the calls does not
+; drown out the data-plane effect of a decision. A knob switch is post checked
+; over `periods` windows: cost after / before > max_regress with a similar mix
+; -> ROLLBACK (the old value is set back).
+;
+; Two modes (param "native"): 1 (default) = the native control kernels of
+; native/rkn_ctl.h: one ndb:sample call per window returns the window
+; features, their EWMA and a change score (max |EWMA mix - mix at the last
+; decision|); tier 1: change < change_hi -> no decision work at all; tier 2:
+; rules on the EWMA mix, and memtable_rep / cache_policy proposals are first
+; checked by a background native simulation on 1-10% sampled ops / block
+; accesses (memtable replay on every rep, LRU/LFU/CLOCK on a SHARDS sample),
+; polled at the next window: SWAP only if the simulated gain >= sim_min_gain,
+; else REJECT. 0 = the first version: ndb:stats parsed in Aura and the rules
+; run every window on the raw window mix, no simulation.
+; An implementation candidate's model-test gate also runs in slices
+; (gate_slice ops per window, nctl:propose-impl!), so the application is never
+; stalled by it; nctl:swap-impl! runs it to completion at once.
+; Every decision is one JSON line (lib/adapt.aura trajectory format, plus
+; "engine":"native"), for aura-loop (aura_loop/adapt_ingest.py).
+(export nctl:new nctl:tick! nctl:sample! nctl:rows nctl:summary nctl:swap-impl! nctl:propose-impl! nctl:gate-running?
+        nctl:gate nctl:params nctl:set-param! nctl:features nctl:overhead-ms nctl:windows nctl:skipped)
+(require "ru" all:)
+(require "rio" all:)
+(require "ndb" all:)
+(require "nmod" all:)
+(require "db" all:)
+(require "adapt" all:)   ; adapt:json (same row format)
+
+(define (nctl-defaults)
+  (list (cons "window" 2000)
+        (cons "mem_write_hi" 0.9) (cons "mem_scan_hi" 0.15) (cons "mem_read_hi" 0.5)
+        (cons "cmp_write_hi" 0.7) (cons "cmp_read_hi" 0.5)
+        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 4) (cons "max_runs" 4)
+        (cons "bloom_hi_miss" 0.5) (cons "bloom_bits_hi" 14) (cons "bloom_bits" 10)
+        (cons "max_regress" 1.15) (cons "similar" 0.2) (cons "periods" 3) (cons "cooldown" 2)
+        (cons "gate_ops" 300) (cons "gate_slice" 60)
+        (cons "native" 1) (cons "alpha" 500) (cons "warmup" 2) (cons "change_hi" 0.15) (cons "sim_min_gain" 1.05)))
+; ctl = #(params traj ndb rows ops-since windows last-stats feats pending cooldowns label overhead-ms knobs history)
+; slot 13: the value the controller last set per knob (a memtable_rep change
+; only shows in the stats after the next rotation)
+(define (nctl:new d traj label knobs)
+  (let ((st (ndb:stats d)))
+    (vector (params-hash (nctl-defaults)) traj d (list) 0 0 #f (list) (list) (list) label 0 knobs
+            (list (cons "memtable_rep" (sv st "mem_rep")) (cons "compaction_style" (sv st "compaction_style"))
+                  (cons "cache_policy" (sv st "cache_policy")) (cons "bloom_bits" #f))
+            (list)       ; slot 14: features of recent windows, newest first
+            0            ; 15: ops ticked in total
+            #f           ; 16: pending simulation #(knob from to kind feats)
+            0            ; 17: windows skipped by the change detector
+            #f           ; 18: gate in progress
+            2000)))      ; 19: window (cached from params)
+(define (intended ctl k) (let ((p (assoc k (vector-ref ctl 13)))) (if p (cdr p) #f)))
+(define (intend! ctl k v) (vector-set! ctl 13 (cons (cons k v) (vector-ref ctl 13))))
+; params live in a hash (an assoc walk costs ~15 us per entry in the
+; interpreter); the window size is also cached in slot 19 for nctl:tick!
+(define (params-hash al) (let ((h (make-hash))) (for-each (lambda (p) (hash-set! h (car p) (cdr p))) al) h))
+(define (np ctl k) (hash-ref (vector-ref ctl 0) k #f))
+(define (nctl:params ctl) (vector-ref ctl 0))
+(define (nctl:set-param! ctl k v) (hash-set! (vector-ref ctl 0) k v) (if (equal? k "window") (vector-set! ctl 19 v) #f) v)
+(define (nctl:rows ctl) (ru:rev (vector-ref ctl 3)))
+(define (nctl:features ctl) (vector-ref ctl 7))
+(define (nctl:overhead-ms ctl) (vector-ref ctl 11))
+(define (nctl:windows ctl) (vector-ref ctl 5))
+(define (knob-on? ctl k) (let loop ((ks (vector-ref ctl 12))) (cond ((null? ks) #f) ((equal? (car ks) k) #t) (else (loop (cdr ks))))))
+(define (sv st k) (let ((p (assoc k st))) (if p (cdr p) 0)))
+
+; ---- sampling: features of the last window from native counter deltas
+(define (nctl-features prev cur)
+  (let* ((d (lambda (k) (- (sv cur k) (if prev (sv prev k) 0))))
+         (puts (+ (d "puts") (d "deletes"))) (gets (d "gets")) (scans (d "scans"))
+         (ops (+ puts gets scans)) (ops1 (if (> ops 0) ops 1))
+         (ns (+ (d "write_ns") (d "read_ns") (d "scan_ns")))
+         (bg (+ (d "flush_ns") (d "compaction_ns")))
+         (cl (+ (d "cache_hits") (d "cache_misses"))))
+    (list (cons "ops" ops) (cons "write_ratio" (/ (* 1.0 puts) ops1)) (cons "read_ratio" (/ (* 1.0 gets) ops1))
+          (cons "scan_ratio" (/ (* 1.0 scans) ops1))
+          (cons "miss_rate" (if (> gets 0) (- 1.0 (/ (* 1.0 (d "gets_found")) gets)) 0.0))
+          (cons "cache_hit_rate" (if (> cl 0) (/ (* 1.0 (d "cache_hits")) cl) 0.0))
+          (cons "ns_per_op" (/ (* 1.0 ns) ops1)) (cons "fg_ns_per_op" (/ (* 1.0 (if (> ns bg) (- ns bg) 0)) ops1))
+          (cons "flushes" (d "flushes")) (cons "compactions" (d "compactions"))
+          (cons "runs" (sv cur "runs")) (cons "l0_files" (sv cur "l0_files")))))
+(define (feat fs k) (let ((p (assoc k fs))) (if p (cdr p) 0.0)))
+
+(define (row! ctl knob from to decision stage speedup reward feats extra)
+  (let ((r (append (list (cons "ts" (current-time-ms)) (cons "op" (vector-ref ctl 15)) (cons "repo" "aura-rocks") (cons "engine" "native") (cons "knob" knob)
+                         (cons "from" from) (cons "to" to) (cons "decision" decision) (cons "stage" stage)
+                         (cons "speedup" speedup) (cons "reward" reward) (cons "label" (vector-ref ctl 10))
+                         (cons "window" (vector-ref ctl 5)) (cons "features" feats))
+                   extra)))
+    (vector-set! ctl 3 (cons r (vector-ref ctl 3)))
+    (if (vector-ref ctl 1) (rio:append! (vector-ref ctl 1) (string-append (adapt:json r) "\n") #f) #f)
+    r))
+
+; ---- the rule policy: wanted value per knob from the features
+(define (want ctl k f st)
+  (let ((w (feat f "write_ratio")) (r (feat f "read_ratio")) (s (feat f "scan_ratio")))
+    (cond ((equal? k "memtable_rep")
+           (cond ((>= w (np ctl "mem_write_hi")) "vector") ((>= s (np ctl "mem_scan_hi")) "skiplist")
+                 ((>= r (np ctl "mem_read_hi")) "hash") (else "skiplist")))
+          ((equal? k "compaction_style")
+           (cond ((>= w (np ctl "cmp_write_hi")) "tiered") ((>= (+ r s) (np ctl "cmp_read_hi")) "leveled") (else (intended ctl k))))
+          ((equal? k "cache_policy")
+           (cond ((equal? (intended ctl k) "none") "none") ((>= s (np ctl "mem_scan_hi")) "clock")
+                 ((>= (feat f "cache_hit_rate") 0.5) "lfu") (else "lru")))
+          ((equal? k "bloom_bits") (if (>= (feat f "miss_rate") (np ctl "bloom_hi_miss")) (np ctl "bloom_bits_hi") (np ctl "bloom_bits")))
+          (else #f))))
+(define (set-string k v)
+  (cond ((equal? k "compaction_style")
+         (string-append "compaction_style=" v ";l0_trigger=" (number->string (if (equal? v "tiered") 8 4)) ";"))
+        ((number? v) (string-append k "=" (number->string v) ";"))
+        (else (string-append k "=" v ";"))))
+(define (cooling? ctl k) (let ((p (assoc k (vector-ref ctl 9)))) (and p (> (cdr p) (vector-ref ctl 5)))))
+(define (cool! ctl k) (vector-set! ctl 9 (cons (cons k (+ (vector-ref ctl 5) (np ctl "cooldown"))) (vector-ref ctl 9))))
+(define (similar? a b ctl)
+  (and (< (abs (- (feat a "write_ratio") (feat b "write_ratio"))) (np ctl "similar"))
+       (< (abs (- (feat a "scan_ratio") (feat b "scan_ratio"))) (np ctl "similar"))
+       (< (abs (- (feat a "miss_rate") (feat b "miss_rate"))) (np ctl "similar"))))
+
+;; pending post checks: #(knob from to window-at-swap feats-before cost-before restore-thunk kind after-costs)
+; cost before = mean ns/op of the last `periods` windows; cost after = mean of
+; the next `periods` windows (an implementation swap skips its first window:
+; the new instance starts with a cold block cache)
+(define (mean xs) (if (null? xs) 0.0 (/ (apply + xs) (* 1.0 (length xs)))))
+(define (take-n xs n) (if (or (null? xs) (= n 0)) (list) (cons (car xs) (take-n (cdr xs) (- n 1)))))
+; the window just measured (f) is the newest "before" window
+; cost per knob: compaction_style is judged on the total native time (flush +
+; compaction included); the others on the foreground time (flush/compaction
+; run inline in a put are subtracted), which they actually change
+(define (cost-key k) (if (equal? k "compaction_style") "ns_per_op" "fg_ns_per_op"))
+(define (cost-before ctl f k) (mean (map (lambda (x) (feat x (cost-key k))) (cons f (take-n (vector-ref ctl 14) (- (np ctl "periods") 1))))))
+(define (post-check! ctl f)
+  (let loop ((ps (vector-ref ctl 8)) (keep (list)))
+    (if (null? ps) (vector-set! ctl 8 (ru:rev keep))
+        (let* ((p (car ps)) (age (- (vector-ref ctl 5) (vector-ref p 3))))
+          (if (or (> age 1) (not (equal? (vector-ref p 7) "impl")))
+              (vector-set! p 8 (cons (feat f (cost-key (vector-ref p 0))) (vector-ref p 8))) #f)
+          (if (< (length (vector-ref p 8)) (np ctl "periods")) (loop (cdr ps) (cons p keep))
+              (let* ((before (vector-ref p 5)) (after (mean (vector-ref p 8)))
+                     (ratio (if (> before 0) (/ after before) 1.0))
+                     (extra (list (cons "cost_before_ns" before) (cons "cost_after_ns" after) (cons "threshold" (np ctl "max_regress")))))
+                (cond ((not (similar? (vector-ref p 4) f ctl))
+                       (row! ctl (vector-ref p 0) (vector-ref p 1) (vector-ref p 2) "KEEP" "post-shifted" (if (> after 0) (/ before after) 1.0) 0 f extra))
+                      ((> ratio (np ctl "max_regress"))
+                       ((vector-ref p 6))
+                       (cool! ctl (vector-ref p 0))
+                       (row! ctl (vector-ref p 0) (vector-ref p 1) (vector-ref p 2) "ROLLBACK" "post" (/ before after) -1 f extra))
+                      (else (row! ctl (vector-ref p 0) (vector-ref p 1) (vector-ref p 2) "KEEP" "post" (if (> after 0) (/ before after) 1.0)
+                                  (if (and (> after 0) (> before 0)) (log (/ before after)) 0) f extra)))
+                (loop (cdr ps) keep)))))))
+(define (pending? ctl k) (let loop ((ps (vector-ref ctl 8))) (cond ((null? ps) #f) ((equal? (vector-ref (car ps) 0) k) #t) (else (loop (cdr ps))))))
+
+(define (apply-knob! ctl k old to f)
+  (let ((d (vector-ref ctl 2)))
+    (ndb:set! d (set-string k to))
+    (intend! ctl k to)
+    (vector-set! ctl 8 (cons (vector k old to (vector-ref ctl 5) f (cost-before ctl f k)
+                                     (lambda () (ndb:set! d (set-string k old)) (intend! ctl k old))
+                                     "knob" (list))
+                             (vector-ref ctl 8)))))
+(define (sim-gated? ctl k) (and (= (np ctl "native") 1) (or (equal? k "memtable_rep") (equal? k "cache_policy"))))
+; -> #t when some knob wants a change it could not get now (post check
+; pending, cooling down, simulator busy): the change detector is then not
+; re-armed, so the next window decides again
+(define (decide! ctl f st)
+  (let ((d (vector-ref ctl 2)))
+    (let loop ((ks (vector-ref ctl 12)) (blocked #f))
+      (if (null? ks) blocked
+          (let* ((k (car ks)) (to (want ctl k f st)) (from (intended ctl k)))
+            (if (and to (not (equal? to from)) (not (equal? to "none"))
+                     (not (and (equal? k "bloom_bits") (not from) (equal? to (np ctl "bloom_bits")))))
+                (let ((old (if from from (np ctl "bloom_bits"))))
+                  (cond ((or (cooling? ctl k) (pending? ctl k)) (loop (cdr ks) #t))
+                        ((sim-gated? ctl k)
+                         (if (and (not (vector-ref ctl 16))
+                                  (ndb:sim-start! d (if (equal? k "memtable_rep") 1 2) (sv st "cache_blocks")))
+                             (begin (vector-set! ctl 16 (vector k old to f)) (loop (cdr ks) blocked))
+                             (loop (cdr ks) #t)))
+                        (else (apply-knob! ctl k old to f)
+                              (row! ctl k old to "SWAP" "policy" 1.0 0 f (list))
+                              (loop (cdr ks) blocked))))
+                (loop (cdr ks) blocked)))))))
+; a finished background simulation: SWAP if the proposal wins by sim_min_gain
+(define (sim-check! ctl)
+  (let ((p (vector-ref ctl 16)))
+    (if (not p) #f
+        (let ((r (ndb:sim-poll (vector-ref ctl 2))))
+          (if (not r) #f
+              (let* ((k (vector-ref p 0)) (from (vector-ref p 1)) (to (vector-ref p 2)) (f (vector-ref p 3))
+                     (mem? (equal? k "memtable_rep"))
+                     (cf (sv r from)) (ct (sv r to))
+                     ; memtable: ns (lower wins); cache: hit ppm (higher wins)
+                     (gain (if mem? (if (> ct 0) (/ (* 1.0 cf) ct) 1.0) (if (> cf 0) (/ (* 1.0 ct) cf) (if (> ct 0) 2.0 1.0))))
+                     (extra (list (cons "sim" (if mem? "memtable_replay" "cache_sim")) (cons "sim_n" (sv r "n"))
+                                  (cons "sim_from" cf) (cons "sim_to" ct) (cons "threshold" (np ctl "sim_min_gain")))))
+                (vector-set! ctl 16 #f)
+                (if (>= gain (np ctl "sim_min_gain"))
+                    (begin (apply-knob! ctl k from to f) (row! ctl k from to "SWAP" "sim" gain 0 f extra))
+                    (begin (cool! ctl k) (row! ctl k from to "REJECT" "sim" gain -0.1 f extra)))
+                #t))))))
+
+; one native stats call per window
+(define nctl-debug (equal? (getenv "NCTL_DEBUG") "1"))
+(define rep-names (vector "skiplist" "vector" "hash"))
+(define cp-names (vector "none" "lru" "lfu" "clock"))
+(define (native-features v)
+  ; the rules read the EWMA mix; post checks read the window cost
+  (list (cons "ops" (vector-ref v 0)) (cons "write_ratio" (vector-ref v 8)) (cons "read_ratio" (vector-ref v 9))
+        (cons "scan_ratio" (vector-ref v 10)) (cons "miss_rate" (vector-ref v 11)) (cons "ns_per_op" (vector-ref v 5))
+        (cons "fg_ns_per_op" (vector-ref v 6)) (cons "cache_hit_rate" (vector-ref v 7)) (cons "change" (vector-ref v 13))
+        (cons "win_write_ratio" (vector-ref v 1)) (cons "win_read_ratio" (vector-ref v 2)) (cons "win_scan_ratio" (vector-ref v 3))
+        (cons "flushes" (vector-ref v 14)) (cons "compactions" (vector-ref v 15)) (cons "runs" (vector-ref v 16)) (cons "l0_files" (vector-ref v 17))))
+(define (native-state v)
+  (list (cons "cache_blocks" (exact (round (vector-ref v 22)))) (cons "mem_rep" (vector-ref rep-names (exact (round (vector-ref v 18)))))
+        (cons "compaction_style" (if (> (vector-ref v 20) 0.5) "tiered" "leveled")) (cons "cache_policy" (vector-ref cp-names (exact (round (vector-ref v 21)))))
+        (cons "impl_version" (exact (round (vector-ref v 23)))) (cons "runs" (vector-ref v 16)) (cons "l0_files" (vector-ref v 17))))
+(define (nctl:sample! ctl)
+  (let* ((t0 (current-time-ms)) (d (vector-ref ctl 2)) (native (= (np ctl "native") 1))
+         (v (if native (ndb:sample-v d (np ctl "alpha") #f) #f))     ; one native call, fixed-width decode
+         (st (if native (native-state v) (ndb:stats d)))
+         (f (if native (native-features v) (nctl-features (vector-ref ctl 6) st))))
+    (vector-set! ctl 5 (+ (vector-ref ctl 5) 1))
+    (if nctl-debug (begin (display (list "nctl window" (vector-ref ctl 5) (feat f "ns_per_op") (feat f "change") (sv st "impl_version") (sv st "mem_rep") (sv st "cache_policy") (sv st "runs") (sv st "l0_files"))) (newline)) #f)
+    (if native #f (vector-set! ctl 6 st))
+    (vector-set! ctl 7 f) (vector-set! ctl 4 0)
+    (gate-step! ctl)
+    (post-check! ctl f)
+    (cond ((<= (vector-ref ctl 5) (np ctl "warmup")) #f)      ; first windows: history only
+          (native
+           (let ((simmed (sim-check! ctl)))
+             (cond ((vector-ref ctl 16) #f)                     ; a simulation is still running
+                   ((or simmed (>= (feat f "change") (np ctl "change_hi")))
+                    ; tier 2; re-arm the detector unless a wanted change had to wait
+                    (if (decide! ctl f st) #f (if (vector-ref ctl 16) #f (ndb:mark! d))))
+                   (else (vector-set! ctl 17 (+ (vector-ref ctl 17) 1))))))   ; tier 1: nothing changed
+          (else (decide! ctl f st)))
+    (vector-set! ctl 14 (take-n (cons f (vector-ref ctl 14)) 8))
+    (vector-set! ctl 11 (+ (vector-ref ctl 11) (- (current-time-ms) t0)))
+    f))
+(define (nctl:tick! ctl)
+  (vector-set! ctl 4 (+ (vector-ref ctl 4) 1))
+  (vector-set! ctl 15 (+ (vector-ref ctl 15) 1))
+  (if (>= (vector-ref ctl 4) (vector-ref ctl 19)) (nctl:sample! ctl) #f))
+(define (nctl:skipped ctl) (vector-ref ctl 17))
+(define (nctl:summary ctl)
+  (map (lambda (r) (list (cdr (assoc "knob" r)) (cdr (assoc "from" r)) (cdr (assoc "to" r)) (cdr (assoc "decision" r)))) (nctl:rows ctl)))
+
+; ---- implementation swap
+; gate: N randomized ops (put / delete / get / scan / flush / compaction /
+; reopen) on a fresh candidate db and on the pure-Aura reference engine, small
+; sizes so flushes and compactions happen; every answer compared.
+(define gseed 99)
+(define (grnd! m) (set! gseed (modulo (+ (* gseed 1103515245) 12345) 2147483648)) (modulo (quotient gseed 16) m))
+(define gate-opts
+  (list (cons "memtable_bytes" 1200) (cons "l0_trigger" 2) (cons "target_file_bytes" 3000) (cons "block_bytes" 256)
+        (cons "bloom_bits" 10) (cons "sync" #f) (cons "auto_compact" #t) (cons "memtable_rep" "skiplist")
+        (cons "compaction_style" "leveled") (cons "max_runs" 3) (cons "block_cache_blocks" 0) (cons "bloom_reads" 1)))
+; gate state #(cand R N i n bad rdir ndir)
+(define (gate-new cand n dir)
+  (let ((rdir (string-append dir "-ref")) (ndir (string-append dir "-cand")))
+    (db:destroy! rdir) (ndb:destroy! ndir)
+    (vector cand (db:open rdir gate-opts) (ndb:open ndir gate-opts cand) 0 n 0 rdir ndir)))
+; run up to m ops; -> #f still running | "PASS" | "FAIL"
+(define (gate-run! g m)
+  (let ((R (vector-ref g 1)) (cand (vector-ref g 0)) (ndir (vector-ref g 7)))
+    (let loop ((j 0))
+      (if (and (< j m) (< (vector-ref g 3) (vector-ref g 4)) (= (vector-ref g 5) 0))
+          (let ((N (vector-ref g 2)) (i (vector-ref g 3)) (w (grnd! 100)) (k (string-append "g" (substring (number->string (+ 1000 (grnd! 120))) 1 4))))
+            (cond ((< w 45) (let ((v (string-append "v" (number->string i)))) (db:put! R k v) (ndb:put! N k v)))
+                  ((< w 60) (db:delete! R k) (ndb:delete! N k))
+                  ((< w 85) (if (equal? (db:get R k) (ndb:get N k)) #f (vector-set! g 5 1)))
+                  ((< w 93) (if (equal? (db:scan R k #f 8) (ndb:scan N k #f 8)) #f (vector-set! g 5 1)))
+                  ((< w 97) (db:flush! R) (ndb:flush! N))
+                  ((< w 98) (db:compact! R) (ndb:compact! N))
+                  (else (ndb:close N) (vector-set! g 2 (ndb:open ndir gate-opts cand))))
+            (vector-set! g 3 (+ i 1))
+            (loop (+ j 1)))
+          #t))
+    (if (or (> (vector-ref g 5) 0) (>= (vector-ref g 3) (vector-ref g 4)))
+        (let ((ok (and (= (vector-ref g 5) 0) (equal? (db:scan R "" #f #f) (ndb:scan (vector-ref g 2) "" #f #f)))))
+          (ndb:close (vector-ref g 2)) (ndb:destroy! ndir) (db:destroy! (vector-ref g 6))
+          (if ok "PASS" "FAIL"))
+        #f)))
+(define (nctl:gate cand n dir) (equal? (gate-run! (gate-new cand n dir) n) "PASS"))
+; move the live db to module m: rotation (flush) = safe point, then close in
+; the old .so and reopen the same files in the new one
+(define (nctl-move! d m)
+  (ndb:flush! d)
+  (let ((dir (ndb:dir d)) (os (ndb:optstring d)))
+    (ndb:close d)
+    (let ((n (ndb:open dir os m)))
+      (ndb:reattach! d m (ndb:handle n))
+      d)))
+(define (impl-name m) (if m (string-append "v" (number->string (nmod:version m))) "none"))
+; gate verdict -> swap or reject
+(define (impl-finish! ctl cand verdict)
+  (let* ((d (vector-ref ctl 2)) (f (vector-ref ctl 7)) (old (ndb:mod d)) (from (impl-name old)) (to (impl-name cand)))
+    (if (not (equal? verdict "PASS"))
+        (begin (row! ctl "implementation" from to "REJECT" "gate" 0 -0.1 f (list (cons "gate_ops" (np ctl "gate_ops")))) "REJECT")
+        (begin
+          (nctl-move! d cand)
+          (vector-set! ctl 6 (ndb:stats d))      ; counters restart in the new .so
+          (if (= (np ctl "native") 1) (ndb:sample-v d (np ctl "alpha") #f) #f)
+          (vector-set! ctl 8 (cons (vector "implementation" from to (vector-ref ctl 5) f (cost-before ctl f "implementation")
+                                           (lambda () (nctl-move! d old) (vector-set! ctl 6 (ndb:stats d))
+                                                   (if (= (np ctl "native") 1) (ndb:sample-v d (np ctl "alpha") #f) #f))
+                                           "impl" (list))
+                                   (vector-ref ctl 8)))
+          (row! ctl "implementation" from to "SWAP" "gate" 1.0 0 f (list (cons "gate_ops" (np ctl "gate_ops"))))
+          "SWAP"))))
+(define (impl-busy? ctl) (or (vector-ref ctl 18) (pending? ctl "implementation")))
+; background-style: the gate advances gate_slice ops per window; the swap
+; happens at the window where it passes. -> "STARTED" | "BUSY" | "ABORT"
+(define (nctl:propose-impl! ctl cand)
+  (cond ((not cand) (row! ctl "implementation" (impl-name (ndb:mod (vector-ref ctl 2))) "none" "ABORT" "load" 0 -2 (vector-ref ctl 7) (list)) "ABORT")
+        ((impl-busy? ctl) "BUSY")
+        (else (vector-set! ctl 18 (gate-new cand (np ctl "gate_ops") (string-append (ndb:dir (vector-ref ctl 2)) "-gate"))) "STARTED")))
+(define (gate-step! ctl)
+  (let ((g (vector-ref ctl 18)))
+    (if g (let ((v (gate-run! g (np ctl "gate_slice"))))
+            (if v (begin (vector-set! ctl 18 #f) (impl-finish! ctl (vector-ref g 0) v)) #f))
+        #f)))
+(define (nctl:gate-running? ctl) (if (vector-ref ctl 18) #t #f))
+; at once: -> "SWAP" (post check pending) | "REJECT" | "ABORT" | "BUSY"
+(define (nctl:swap-impl! ctl cand)
+  (let ((t0 (current-time-ms)) (r (nctl:propose-impl! ctl cand)))
+    (if (equal? r "STARTED")
+        (let* ((g (vector-ref ctl 18)) (v (gate-run! g (np ctl "gate_ops"))))
+          (vector-set! ctl 18 #f)
+          (let ((out (impl-finish! ctl (vector-ref g 0) v)))
+            (vector-set! ctl 11 (+ (vector-ref ctl 11) (- (current-time-ms) t0)))
+            out))
+        r)))

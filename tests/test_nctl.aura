@@ -1,0 +1,92 @@
+; tests/test_nctl.aura — the native control plane (lib/nctl.aura):
+; decisions from one native sample call per window (features + EWMA + change
+; detector), memtable / cache proposals checked by background native
+; simulations, knob post checks, and implementation swaps gated by a model
+; test vs the pure-Aura engine: a good candidate (v2) is swapped in at a
+; rotation with every key intact (the gate run in slices, between windows), a
+; wrong one (RKN_BUG_RESURRECT) is REJECTed, a slow one (RKN_SLOW_GET) is
+; swapped in and then ROLLBACKed by the post check. Also the first version of
+; the controller (native=0: stats parsed in Aura, rules every window).
+(require "expect" all:)
+(require "ru" all:)
+(require "rio" all:)
+(require "hot" all:)
+(require "ndb" all:)
+(require "nmod" all:)
+(require "nctl" all:)
+(hot:load!)   ; top-level statement: see lib/hot.aura
+(define (check name ok) (expect name ok))
+(define DIR (string-append (ru:root) "/build/test-nctl-" (number->string (current-time-ms))))
+(define TRAJ (string-append DIR ".jsonl"))
+(define (key i) (string-append "k" (substring (number->string (+ 1000000 i)) 1 7)))
+(define val "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
+(define OPTS (list (cons "memtable_bytes" 16384) (cons "time_ops" 1) (cons "block_cache_blocks" 64) (cons "sample_pct" 10) (cons "fsync_tables" 0)
+                   (cons "memtable_rep" "skiplist") (cons "compaction_style" "leveled")))
+(ndb:destroy! DIR)
+(define d (ndb:open DIR OPTS))
+(define ctl (nctl:new d TRAJ "test" (list "memtable_rep" "compaction_style" "cache_policy" "bloom_bits")))
+(nctl:set-param! ctl "window" 500)
+(define (st k) (cdr (assoc k (ndb:stats d))))
+(define (rows-of k dec) (let loop ((rs (nctl:rows ctl)) (n 0)) (if (null? rs) n (loop (cdr rs) (if (and (equal? (cdr (assoc "knob" (car rs))) k) (equal? (cdr (assoc "decision" (car rs))) dec)) (+ n 1) n)))))
+(define (stage-rows s) (let loop ((rs (nctl:rows ctl)) (n 0)) (if (null? rs) n (loop (cdr rs) (if (equal? (cdr (assoc "stage" (car rs))) s) (+ n 1) n)))))
+(define NK 3000)
+(define (writes! n) (let loop ((i 0)) (if (< i n) (begin (ndb:put! d (key (modulo i NK)) val) (nctl:tick! ctl) (loop (+ i 1))) #t)))
+(define (reads! n) (let loop ((i 0)) (if (< i n) (begin (ndb:get d (key (modulo (* i 13) NK))) (nctl:tick! ctl) (loop (+ i 1))) #t)))
+(define (scans! n) (let loop ((i 0)) (if (< i n) (begin (ndb:scan d (key (modulo (* i 13) NK)) #f 10) (nctl:tick! ctl) (loop (+ i 1))) #t)))
+(define (misses! n) (let loop ((i 0)) (if (< i n) (begin (ndb:get d (string-append "zz" (key i))) (nctl:tick! ctl) (loop (+ i 1))) #t)))
+; write phase -> tiered; memtable proposal (vector) checked by the replay sim
+(writes! NK)
+; (the decision, not the final state: its post check compares windows of a
+; growing db, and may roll it back on a loaded box; see docs/adaptive.md)
+(check "write phase: tiered chosen" (> (rows-of "compaction_style" "SWAP") 0))
+(check "write phase: memtable proposal simulated" (> (stage-rows "sim") 0))
+(check "write phase: vector after the sim" (= (rows-of "memtable_rep" "SWAP") 1))
+; read phase -> leveled
+(reads! 3000)
+(check "read phase: leveled" (equal? (st "compaction_style") "leveled"))
+(check "read phase: hash proposal simulated" (> (stage-rows "sim") 1))
+; scans -> skiplist proposal
+(scans! 2000)
+(check "scan phase: memtable decision for scans" (let loop ((rs (nctl:rows ctl))) (cond ((null? rs) #f) ((and (equal? (cdr (assoc "knob" (car rs))) "memtable_rep") (equal? (cdr (assoc "to" (car rs))) "skiplist")) #t) (else (loop (cdr rs))))))
+; missing keys -> bloom bits
+(misses! 2000)
+(check "miss phase: bloom_bits decision" (> (rows-of "bloom_bits" "SWAP") 0))
+(check "change detector skipped stable windows" (> (nctl:skipped ctl) 0))
+(check "knob switches post checked" (> (+ (stage-rows "post") (stage-rows "post-shifted")) 0))
+; implementation swaps
+(nctl:set-param! ctl "max_regress" 2.0)   ; a test box may be busy; the slow build is ~50x
+(reads! 1500)   ; baseline windows of the workload the swaps are judged on
+(define v2 (ndb:load-module "rkn" "-DRKN_IMPL_VERSION=2 -O3"))
+(check "v2 builds" (and v2 (= (nmod:version v2) 2)))
+(check "v2 gate started in slices" (equal? (nctl:propose-impl! ctl v2) "STARTED"))
+(check "second proposal while gating: BUSY" (equal? (nctl:propose-impl! ctl v2) "BUSY"))
+(reads! 500)
+(check "gate still running after one window (sliced)" (nctl:gate-running? ctl))
+(let loop ((n 0)) (if (and (nctl:gate-running? ctl) (< n 40)) (begin (reads! 500) (loop (+ n 1))) #t))
+(check "v2 swapped in after the gate" (= (st "impl_version") 2))
+(check "keys intact after swap" (let loop ((i 0)) (cond ((>= i NK) #t) ((equal? (ndb:get d (key i)) val) (loop (+ i 1))) (else #f))))
+(reads! 2500)
+(check "v2 kept" (and (= (rows-of "implementation" "KEEP") 1) (= (rows-of "implementation" "ROLLBACK") 0)))
+(define bug (ndb:load-module "rkn" "-DRKN_IMPL_VERSION=3 -DRKN_BUG_RESURRECT"))
+(check "wrong build REJECTed by the gate" (equal? (nctl:swap-impl! ctl bug) "REJECT"))
+(check "still v2 after reject" (= (st "impl_version") 2))
+(define slow (ndb:load-module "rkn" "-DRKN_IMPL_VERSION=4 -DRKN_SLOW_GET"))
+(check "slow build passes the gate" (equal? (nctl:swap-impl! ctl slow) "SWAP"))
+(reads! 2500)
+(check "slow build ROLLBACKed" (= (rows-of "implementation" "ROLLBACK") 1))
+(check "back on v2" (= (st "impl_version") 2))
+(check "keys intact after rollback" (let loop ((i 0)) (cond ((>= i NK) #t) ((equal? (ndb:get d (key i)) val) (loop (+ i 1))) (else #f))))
+(check "trajectory written" (> (string-length (rio:read TRAJ)) 100))
+(display (nctl:summary ctl)) (newline)
+(display (list "controller ms" (nctl:overhead-ms ctl) "windows" (nctl:windows ctl) "skipped" (nctl:skipped ctl))) (newline)
+(ndb:close d) (ndb:destroy! DIR)
+; first version (native=0): stats parsed in Aura, rules every window, no sims
+(ndb:destroy! DIR)
+(set! d (ndb:open DIR OPTS))
+(define c0 (nctl:new d #f "test-v0" (list "memtable_rep" "compaction_style")))
+(nctl:set-param! c0 "native" 0) (nctl:set-param! c0 "window" 500)
+(let loop ((i 0)) (if (< i 2000) (begin (ndb:put! d (key i) val) (nctl:tick! c0) (loop (+ i 1))) #t))
+(check "v0 controller: write phase -> tiered + vector" (and (equal? (st "compaction_style") "tiered") (>= (length (nctl:rows c0)) 2)))
+(ndb:close d) (ndb:destroy! DIR)
+(check "no leaked handles" (= (ndb:live) 0))
+(expect-summary)
