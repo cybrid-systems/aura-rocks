@@ -215,13 +215,14 @@
 ; ---- one decision point. event: "rotate" (memtable flush) or "window" (observer window closed)
 (define (adapt:tick! ctl db event)
   (let ((fs (obs:features (db:obs db))))
-    (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)))) #f
+    ; window events: live memtable switching, and compaction (a read phase has no flushes)
+    (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)) (not (knob-on? ctl "compaction")))) #f
         (begin
           (close-period! ctl db)
           (let ((t0 (current-time-ms)))
             (post-check! ctl db fs)
-            (if (knob-on? ctl "memtable_rep") (tick-mem! ctl db fs) #f)
-            (if (and (knob-on? ctl "compaction") (equal? event "rotate")) (tick-cmp! ctl db fs) #f)
+            (if (and (knob-on? ctl "memtable_rep") (or (equal? event "rotate") (vector-ref ctl 7))) (tick-mem! ctl db fs) #f)
+            (if (knob-on? ctl "compaction") (tick-cmp! ctl db fs) #f)
             (let ((now (current-time-ms)))
               (vector-set! ctl 13 (+ (vector-ref ctl 13) (- now t0)))
               (vector-set! ctl 9 now)))

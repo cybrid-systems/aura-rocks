@@ -2,20 +2,28 @@
 ;
 ; Write path:  WAL append (rio:append!)  ->  memtable (skiplist)
 ;              memtable >= memtable-bytes  ->  flush to a new L0 SST, new WAL
-;              L0 files >= l0-trigger      ->  compact L0 + L1 -> new L1 files
-; Read path:   memtable -> L0 newest first -> L1 (non-overlapping, by range),
+;              L0 files >= l0-trigger      ->  compaction (style below)
+; Read path:   memtable -> L0 newest first -> sorted runs newest first (each
+;              run non-overlapping, found by range),
 ;              each SST: key range, bloom filter, index, verified block, seek.
 ; Recovery:    MANIFEST (atomic tmp + rename) lists the live SSTs and the WAL;
 ;              open replays the WAL into a fresh memtable.
-; Levels: L0 (overlapping, newest first) and L1 (sorted, non-overlapping,
-; bottommost: compaction drops tombstones and overwritten versions).
+; Levels: L0 (overlapping, newest first) and a list of sorted runs below it
+; (each run sorted and non-overlapping; "L1" = all runs).
+; Compaction style (option, else the workspace define rk-compaction-style):
+;   leveled  L0 + every run -> one run (bottommost: tombstones and shadowed
+;            versions dropped). One run to read; rewrites everything each time.
+;   tiered   L0 -> one new run on top (tombstones kept while older runs exist);
+;            when runs > max_runs, all runs -> one run. Low write amp, more
+;            runs to read (RocksDB universal compaction, simplified).
+; l0_trigger and max_runs: option, else rk-l0-trigger / rk-max-runs.
 ;
 ; db = #(dir mem wal-num next-file levels opts stats obs hook)
 ; hook: #f or (lambda (db event)) called at decision points: "rotate" (before
 ; the next memtable is created at a flush) and "window" (observer window closed)
 ; obs: lib/obs.aura workload observer (every put/delete/get/scan is recorded)
 (export db:open db:put! db:delete! db:get db:scan db:flush! db:compact! db:close
-        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs db:mem-rep db:migrate-mem! db:set-hook!)
+        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs db:mem-rep db:migrate-mem! db:set-hook! db:runs db:compaction-style)
 (require "leaf" all:)
 (require "ru" all:)
 (require "rio" all:)
@@ -30,7 +38,9 @@
 ; ---- options: alist ("name" . value)
 (define (db:options)
   (list (cons "memtable_bytes" 65536)     ; flush threshold (approx. encoded bytes)
-        (cons "l0_trigger" 4)             ; L0 files that trigger L0 -> L1 compaction
+        (cons "l0_trigger" #f)            ; L0 files that trigger a compaction (#f: workspace rk-l0-trigger)
+        (cons "compaction_style" #f)      ; "leveled" "tiered" (#f: workspace rk-compaction-style)
+        (cons "max_runs" #f)              ; tiered: runs before a full merge (#f: workspace rk-max-runs)
         (cons "target_file_bytes" 262144) ; L1 output file size
         (cons "block_bytes" 4096)
         (cons "bloom_bits" 10)            ; bits per key, 0 = no filter checks
@@ -70,13 +80,20 @@
     (if (equal? name "sst_bytes_written") (obs:note-sst-bytes! (vector-ref db 7) n) #f)))
 (define (db:stats db)
   (let loop ((ns db-stat-names) (i 0) (acc (list)))
-    (if (null? ns) (append (ru:rev acc) (list (cons "l0_files" (ru:len (db:level-files db 0))) (cons "l1_files" (ru:len (db:level-files db 1)))
+    (if (null? ns) (append (ru:rev acc) (list (cons "l0_files" (ru:len (db:level-files db 0))) (cons "l1_files" (ru:len (db:level-files db 1))) (cons "runs" (ru:len (db:runs db))) (cons "compaction_style" (db:compaction-style db))
                                                (cons "mem_entries" (mem:count (vector-ref db 1))) (cons "mem_rep" (mem:rep (vector-ref db 1))) (cons "io" (rio:mode))) (sst:stats))
         (loop (cdr ns) (+ i 1) (cons (cons (car ns) (vector-ref (vector-ref db 6) i)) acc)))))
 
 (define (db:dir db) (vector-ref db 0))
 (define (db:mem db) (vector-ref db 1))
-(define (db:level-files db l) (vector-ref (vector-ref db 4) l))
+; levels = #(l0-tables runs) ; runs = list (newest first) of lists of tables
+(define (db:runs db) (vector-ref (vector-ref db 4) 1))
+(define (db:level-files db l)
+  (if (= l 0) (vector-ref (vector-ref db 4) 0)
+      (let loop ((rs (db:runs db)) (acc (list))) (if (null? rs) acc (loop (cdr rs) (append acc (car rs)))))))
+(define (db:compaction-style db) (let ((v (db-opt-or db "compaction_style" #f))) (if v v (leaf:compaction-style))))
+(define (db-l0-trigger db) (let ((v (db-opt-or db "l0_trigger" #f))) (if v v (leaf:l0-trigger))))
+(define (db-max-runs db) (let ((v (db-opt-or db "max_runs" #f))) (if v v (leaf:max-runs))))
 (define (db-file db num ext) (ru:path (vector-ref db 0) (string-append (ru:pad num 6) ext)))
 (define (db:wal-path db) (db-file db (vector-ref db 2) ".log"))
 (define (db-new-file-num! db) (let ((n (vector-ref db 3))) (vector-set! db 3 (+ n 1)) n))
@@ -86,14 +103,16 @@
   (leaf:dec path (- (string-length path) 10) 6))
 (define (db-manifest-text db)
   (let ((names (lambda (ts) (let loop ((ts ts) (acc (list))) (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (string-append " " (ru:pad (db-file-num (sst:path (car ts))) 6)) acc)))))))
-    (ru:concat (append (list "AROCKS-MANIFEST 1\nnext " (number->string (vector-ref db 3)) "\nwal " (number->string (vector-ref db 2)) "\nL0")
-                       (names (db:level-files db 0)) (list "\nL1") (names (db:level-files db 1)) (list "\n")))))
+    (ru:concat (append (list "AROCKS-MANIFEST 2\nnext " (number->string (vector-ref db 3)) "\nwal " (number->string (vector-ref db 2)) "\nL0")
+                       (names (db:level-files db 0)) (list "\n")
+                       (let loop ((rs (db:runs db)) (acc (list))) (if (null? rs) acc (loop (cdr rs) (append acc (list "R") (names (car rs)) (list "\n")))))))))
 (define (db-write-manifest! db)
   (let ((tmp (ru:path (vector-ref db 0) "MANIFEST.tmp")))
     (rio:write tmp (db-manifest-text db))
     (rio:rename! tmp (ru:path (vector-ref db 0) "MANIFEST"))))
 
-; manifest text -> (next wal l0-nums l1-nums)
+; manifest text -> (next wal l0-nums runs) ; runs: list of num lists, newest first
+; ("L1 ..." from a version 1 manifest is one run)
 (define (db-split s ch)  ; split on char code ch, dropping empty pieces
   (let loop ((i 0) (start 0) (acc (list)))
     (cond ((>= i (string-length s)) (ru:rev (if (> i start) (cons (substring s start i) acc) acc)))
@@ -106,7 +125,7 @@
           (cond ((equal? tag "next") (loop (cdr lines) (car nums) wal l0 l1))
                 ((equal? tag "wal") (loop (cdr lines) next (car nums) l0 l1))
                 ((equal? tag "L0") (loop (cdr lines) next wal nums l1))
-                ((equal? tag "L1") (loop (cdr lines) next wal l0 nums))
+                ((or (equal? tag "L1") (equal? tag "R")) (loop (cdr lines) next wal l0 (if (null? nums) l1 (append l1 (list nums)))))
                 (else (loop (cdr lines) next wal l0 l1)))))))
 
 ; ---- open
@@ -121,7 +140,7 @@
     (vector-set! db 7 (obs:new (db-opt-or db "obs_window" 200)))
     (vector-set! db 1 (db-new-mem db))
     (vector-set! (vector-ref db 4) 0 (open-all (car (cdr (cdr m)))))
-    (vector-set! (vector-ref db 4) 1 (open-all (car (cdr (cdr (cdr m))))))
+    (vector-set! (vector-ref db 4) 1 (map open-all (car (cdr (cdr (cdr m))))))
     (if (and ms (> (car (cdr m)) 0))
         (begin
           (vector-set! db 2 (car (cdr m)))
@@ -167,54 +186,76 @@
           (vector-set! db 2 (db-new-file-num! db))
           (db-write-manifest! db)
           (rio:unlink! old-wal)
-          (if (and (db:opt db "auto_compact") (>= (ru:len (db:level-files db 0)) (db:opt db "l0_trigger")))
-              (db:compact! db) #f)
+          (if (and (db:opt db "auto_compact") (>= (ru:len (db:level-files db 0)) (db-l0-trigger db)))
+              (db-auto-compact! db) #f)
           #t))))
 
-; ---- compaction: all of L0 + all of L1 -> new L1 (bottommost: drop tombstones)
+; ---- compaction
 (define (db-sum-sizes ts) (let loop ((ts ts) (n 0)) (if (null? ts) n (loop (cdr ts) (+ n (sst:size (car ts)))))))
 (define (db-entry-bytes e) (+ 17 (string-length (car (cdr e))) (string-length (car (cdr (cdr e))))))
-; write one L1 output file from cur (reversed entries); returns the opened table
+; write one output file from cur (reversed entries); returns the opened table
 (define (db-write-output! db cur)
   (let* ((num (db-new-file-num! db))
          (meta (sst:write (db-file db num ".sst") (ru:rev cur) (db:opt db "block_bytes") (db:opt db "bloom_bits"))))
     (db-bump! db "compaction_bytes_out" (car (cdr (cdr meta))))
     (db-bump! db "sst_bytes_written" (car (cdr (cdr meta))))
     (sst:open (car meta))))
-(define (db-install-l1! db inputs outs)
-  (vector-set! (vector-ref db 4) 0 (list))
-  (vector-set! (vector-ref db 4) 1 (ru:rev outs))
+; merge inputs (newest first) into one sorted run of files; bottommost: drop tombstones
+(define (db-merge-run! db inputs bottommost)
+  (let ((mg (merge:first! (merge:new (let loop ((ts inputs) (acc (list))) (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc)))))))
+        (target (db:opt db "target_file_bytes")))
+    (db-bump! db "compaction_bytes_in" (db-sum-sizes inputs))
+    (let loop ((cur (list)) (cur-bytes 0) (outs (list)))
+      (let ((e (merge:next-entry! mg)))
+        (cond
+          ((not e) (ru:rev (if (null? cur) outs (cons (db-write-output! db cur) outs))))
+          ((and bottommost (= (car e) entry:del)) (loop cur cur-bytes outs))
+          ((>= cur-bytes target) (loop (list e) (db-entry-bytes e) (cons (db-write-output! db cur) outs)))
+          (else (loop (cons e cur) (+ cur-bytes (db-entry-bytes e)) outs)))))))
+(define (db-install! db l0 runs inputs)
+  (vector-set! (vector-ref db 4) 0 l0)
+  (vector-set! (vector-ref db 4) 1 (let loop ((rs runs) (acc (list))) (if (null? rs) (ru:rev acc) (loop (cdr rs) (if (null? (car rs)) acc (cons (car rs) acc))))))
   (db-write-manifest! db)
   (let del ((ts inputs)) (if (null? ts) #t (begin (rio:unlink! (sst:path (car ts))) (del (cdr ts)))))
   (db-bump! db "compactions" 1)
   #t)
-(define (db:compact! db)
-  (let* ((t0 (current-time-ms)) (r (db-compact-all! db)))
+(define (db-timed! db thunk)
+  (let* ((t0 (current-time-ms)) (r (thunk)))
     (db-bump! db "compaction_ms" (- (current-time-ms) t0))
     r))
-(define (db-compact-all! db)
-  (let* ((l0 (db:level-files db 0)) (l1 (db:level-files db 1)) (inputs (append l0 l1)))
-    (if (null? l0) #f
-        (let ((mg (merge:first! (merge:new (let loop ((ts inputs) (acc (list))) (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc)))))))
-              (target (db:opt db "target_file_bytes")))
-          (db-bump! db "compaction_bytes_in" (db-sum-sizes inputs))
-          ; L1 is the bottommost level: tombstones and shadowed versions are dropped
-          (let loop ((cur (list)) (cur-bytes 0) (outs (list)))
-            (let ((e (merge:next-entry! mg)))
-              (cond
-                ((not e) (db-install-l1! db inputs (if (null? cur) outs (cons (db-write-output! db cur) outs))))
-                ((= (car e) entry:del) (loop cur cur-bytes outs))
-                ((>= cur-bytes target) (loop (list e) (db-entry-bytes e) (cons (db-write-output! db cur) outs)))
-                (else (loop (cons e cur) (+ cur-bytes (db-entry-bytes e)) outs)))))))))
+; full compaction: L0 + every run -> one run (any style; also used when the
+; controller leaves tiered)
+(define (db:compact! db)
+  (db-timed! db (lambda ()
+    (let ((inputs (db:level-files db 0)) (all (append (db:level-files db 0) (db:level-files db 1))))
+      (if (and (null? inputs) (<= (ru:len (db:runs db)) 1)) #f
+          (db-install! db (list) (list (db-merge-run! db all #t)) all))))))
+; at a flush, once L0 reached the trigger: by style
+(define (db-auto-compact! db)
+  (if (equal? (db:compaction-style db) "tiered")
+      (db-timed! db (lambda ()
+        (let* ((l0 (db:level-files db 0)) (runs (db:runs db))
+               (run (db-merge-run! db l0 (null? runs))))
+          (db-install! db (list) (cons run runs) l0)
+          (if (> (ru:len (db:runs db)) (db-max-runs db))
+              (let ((all (db:level-files db 1))) (db-install! db (list) (list (db-merge-run! db all #t)) all))
+              #f))))
+      (db:compact! db)))
 
 ; ---- reads
-; -> (hit . probes): hit = #f or (type . val) from L1, probes = SST files consulted
-(define (db-l1-get db key use-bloom)
-  (let loop ((ts (db:level-files db 1)))
+; -> (hit . probes): hit = #f or (type . val) from the newest run holding key,
+; probes = SST files consulted
+(define (db-run-get ts key use-bloom)
+  (let loop ((ts ts))
     (cond ((null? ts) (cons #f 0))
           ((string<? (sst:largest (car ts)) key) (loop (cdr ts)))
           ((string<? key (sst:smallest (car ts))) (cons #f 0))
           (else (cons (sst:get (car ts) key use-bloom) 1)))))
+(define (db-l1-get db key use-bloom)
+  (let loop ((rs (db:runs db)) (probes 0))
+    (if (null? rs) (cons #f probes)
+        (let ((r (db-run-get (car rs) key use-bloom)))
+          (if (car r) (cons (car r) (+ probes (cdr r))) (loop (cdr rs) (+ probes (cdr r))))))))
 (define (db-resolve hit) (if (and hit (= (car hit) entry:put)) (cdr hit) #f))
 ; -> #(value level probes): level "mem" "l0" "l1" or #f
 (define (db-get-full db key)

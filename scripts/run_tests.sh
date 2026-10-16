@@ -9,11 +9,11 @@ cd "$REPO_ROOT"
 status=0
 files=("$@")
 [ ${#files[@]} -eq 0 ] && files=("$REPO_ROOT"/tests/*.aura)
-# tests that take a memtable rep run once per rep (ROCKS_TEST_REP)
+# tests that take a config run once per memtable-rep:compaction-style pair (ROCKS_TEST_REP)
 runs=()
 for t in "${files[@]}"; do
   if grep -q 'ROCKS_TEST_REP' "$t"; then
-    for r in ${ROCKS_TEST_REPS:-skiplist vector hash}; do runs+=("$t@$r"); done
+    for r in ${ROCKS_TEST_REPS:-skiplist:leveled vector:leveled hash:leveled skiplist:tiered vector:tiered hash:tiered}; do runs+=("$t@$r"); done
   else
     runs+=("$t@")
   fi
