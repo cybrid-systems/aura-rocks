@@ -3,6 +3,7 @@
 (require "ru" all:)
 (require "rio" all:)
 (require "hot" all:)
+(require "rsink" all:)
 (require "entry" all:)
 (require "wal" all:)
 (require "memtable" all:)
@@ -11,6 +12,9 @@
 (display "RUN-ONCE") (newline)
 (rio:init!)
 (hot:load!)
+; $ROCKS_TEST_SINK=1: every leaf runs its C kernel (lib/rsink.aura install-all)
+(define SINKED (if (equal? (getenv "ROCKS_TEST_SINK") "1") (rsink:install-all!) (list)))
+(if (equal? (getenv "ROCKS_TEST_SINK") "1") (begin (display "sink: installed ") (display (length SINKED)) (newline)) #f)
 (define tmp (string-append (ru:root) "/build/test-units"))
 (shell (string-append "rm -rf " tmp " && mkdir -p " tmp))
 

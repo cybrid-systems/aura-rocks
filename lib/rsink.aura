@@ -1,18 +1,22 @@
 ; lib/rsink.aura — sink the engine's hot leaves with aura-kernel-sink.
 ;
-; For each define in ws/hot.aura, policy:sink! (aura-kernel-sink lib/policy):
-;   profile the Soft define on real engine data -> SKIP below the floor
-;   vkgen ("S" byte-string kinds) + background cc -> content-addressed .so
-;   shadow gate against the live define (no mutation on mismatch: ABORT)
-;   one mutate:atomic-batch (slot + wrapper), eval-current, measured speedup
-;   vs (sink-min-speedup) -> KEEP, or hot-strategy:heal! back (ROLLBACK)
-; and one JSON row per decision in the trajectory file. The engine keeps
-; calling the names; a KEEP turns them into guarded C calls, a ROLLBACK
-; leaves the Soft body.
+; Every leaf in ws/hot.aura has a hand-written C kernel in
+; kernels/rocks_leaves.c. For each, policy:sink-host! (aura-kernel-sink
+; lib/policy.aura):
+;   profile the Soft define through its lib/leaf.aura entry -> SKIP below the floor
+;   cc once -> content-addressed .so, aot:reload + c-load + ABI check
+;   install the raw c-func into the leaf's host slot (lib/leaf.aura)
+;   shadow gate: entry point vs the Aura define on edge-case args (ABORT + uninstall)
+;   golden check + timed bench vs the Soft run -> KEEP, or uninstall (ROLLBACK)
+; and one JSON row per decision in the trajectory file. The workspace is not
+; mutated (no mutate:rebind / eval-current: aura#4550, aura#4547).
+; Coarse kernels (one call per WAL record, block build, filter build, block
+; point lookup, cache simulation) replace the per-byte / per-field leaves on
+; the engine's paths.
 ;
 ; Sample data is real engine data: a 4 KB data block written by
 ; lib/block.aura, its keys, a bloom filter from lib/bloom.aura.
-(export rsink:sink-all! rsink:samples rsink:summary rsink:rows)
+(export rsink:sink-all! rsink:install-all! rsink:kernels rsink:samples rsink:summary rsink:rows)
 (require "leaf" all:)
 (require "ru" all:)
 (require "entry" all:)
@@ -21,6 +25,7 @@
 (require "plant" all:)
 (require "score" all:)
 (require "policy" all:)
+(require "csink" all:)
 
 (define (rs-key i) (string-append "user" (ru:pad (* i 7919) 12)))
 (define (rs-val i) (let loop ((k 0) (acc (list))) (if (< k 100) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (+ i k) 26))) acc)) (list->string acc))))
@@ -34,8 +39,21 @@
          (f (bloom:parse (bloom:build (let loop ((i 0) (acc (list))) (if (< i 1000) (loop (+ i 1) (cons (rs-key i) acc)) acc)) 10)))
          (hs (let ((v (make-vector 100 0))) (let loop ((i 0)) (if (< i 100) (begin (vector-set! v i (leaf:hash (rs-key (* 3 i)) 0)) (loop (+ i 1))) v)))))
     (vector blk n (blk:ra blk n) (list->vector keys) (car f) (car (cdr f)) (car (cdr (cdr f))) hs
-            "000000000123456789987654321000042000999")))
+            "000000000123456789987654321000042000999"
+            ; 9: entries blob of the block, 10: keyblob of 1000 keys, 11: access trace (512 skewed keys)
+            (substring blk 0 (blk:ra blk n))
+            (bloom:keyblob (let loop ((i 0) (acc (list))) (if (< i 1000) (loop (+ i 1) (cons (rs-key i) acc)) acc)))
+            (let loop ((i 0) (acc (list)))
+              (if (< i 512) (loop (+ i 1) (cons (rs-key (modulo (* i i 7) (if (= 0 (modulo i 3)) 400 40))) acc))
+                  (let j ((xs (cdr acc)) (out (car acc))) (if (null? xs) out (j (cdr xs) (string-append out "\n" (car xs))))))))))
 
+;; name in only, a comma-separated list
+(define (rs-in? name only)
+  (let ((pat (string-append "," name ",")) (hay (string-append "," only ",")))
+    (let loop ((i 0))
+      (cond ((> (+ i (string-length pat)) (string-length hay)) #f)
+            ((string=? (substring hay i (+ i (string-length pat))) pat) #t)
+            (else (loop (+ i 1)))))))
 (define rsink-rows (list))
 (define (rsink:rows) rsink-rows)
 
@@ -43,31 +61,94 @@
 ; only: #f (all) or a kernel name. floor-us: SKIP below this Soft us/call.
 ; threshold: #f = workspace (sink-min-speedup). Returns the rows.
 (define (rsink:sink-all! plant s only floor-us threshold traj)
+  (set! rsink-ctx (list plant only floor-us threshold traj (string-append (ru:root) "/kernels/rocks_leaves.c")))
   (let* ((blk (vector-ref s 0)) (n (vector-ref s 1)) (ra (vector-ref s 2)) (keys (vector-ref s 3))
-         (bits (vector-ref s 4)) (nbits (vector-ref s 5)) (bk (vector-ref s 6)) (hs (vector-ref s 7)) (digits (vector-ref s 8))
-         (L (string-length blk)) (nk (vector-length keys))
-         (run? (lambda (name) (or (not only) (equal? only name))))
-         (one! (lambda (name samples probe cases shadow bench-arg reps)
-                 (if (run? name)
-                     (let ((row (policy:sink! plant name samples probe cases shadow bench-arg reps floor-us threshold traj)))
-                       (policy:print row)
-                       (set! rsink-rows (cons row rsink-rows))
-                       row)
-                     #f))))
-    (one! "rk-checksum" (list blk 0 L) (lambda (k) (leaf:checksum blk 0 k))
-          (list 0 1 11 L) (list (list blk 0 L) (list blk 7 100) (list "Wikipedia" 0 9) (list "" 0 0)) L 10)
-    (one! "rk-hash" (list (vector-ref keys 3) 0) (lambda (k) (leaf:hash (vector-ref keys (modulo k nk)) k))
+         (digits (vector-ref s 8)) (L (string-length blk)) (nk (vector-length keys)))
+    (rs-c! "rk-checksum" "rk_checksum" (list "S" "I" "I") "I" (list blk 0 L) (lambda (k) (leaf:checksum blk 0 k))
+          (list 0 1 11 L) (list (list blk 0 L) (list blk 7 100) (list "Wikipedia" 0 9) (list "" 0 0) (list "abc" 2 1)) L 10)
+    (rs-c! "rk-hash" "rk_hash_k" (list "S" "I") "I" (list (vector-ref keys 3) 0) (lambda (k) (leaf:hash (vector-ref keys (modulo k nk)) k))
           (list 0 1 7 99) (list (list (vector-ref keys 0) 0) (list "" 5) (list "a" 1) (list blk 7)) 3 200)
-    (one! "rk-bloom-probe" (list bits nbits (vector-ref hs 0) bk) (lambda (j) (leaf:bloom-probe bits nbits (vector-ref hs (modulo j 100)) bk))
-          (list 0 1 2 50 99) (list (list bits nbits (vector-ref hs 0) bk) (list bits nbits 12345 bk) (list bits nbits 0 1) (list "o" 6 3 2)) 3 200)
-    (one! "rk-dec" (list digits 0 6) (lambda (k) (leaf:dec digits (modulo k 30) 6))
+    (rs-c! "rk-dec" "rk_dec" (list "S" "I" "I") "I" (list digits 0 6) (lambda (k) (leaf:dec digits (modulo k 30) 6))
           (list 0 1 9 29) (list (list digits 0 6) (list digits 3 12) (list "7" 0 1) (list digits 5 0)) 9 300)
-    (one! "rk-block-seek" (list blk (vector-ref keys 5) n ra) (lambda (j) (leaf:block-seek blk (vector-ref keys (modulo (* j 7) nk)) n ra))
+    (rs-c! "rk-block-seek" "rk_block_seek" (list "S" "S" "I" "I") "I" (list blk (vector-ref keys 5) n ra)
+          (lambda (j) (leaf:block-seek blk (vector-ref keys (modulo (* j 7) nk)) n ra))
           (list 0 1 5 17 30)
           (list (list blk (vector-ref keys 0) n ra) (list blk "" n ra) (list blk "zzzz" n ra) (list blk "user0000" n ra)
                 (list blk (string-append (vector-ref keys 9) "0") n ra) (list blk (vector-ref keys (- nk 1)) n ra))
           7 200)
+    (rsink-coarse! plant s only floor-us threshold traj)
     (ru:rev rsink-rows)))
+
+;; every leaf: a hand-written kernel (kernels/rocks_leaves.c) installed
+;; into its lib/leaf.aura host slot by aura-kernel-sink policy:sink-host!;
+;; a module function, not a closure in the sink-all! frame (aura#4532)
+(define rsink-ctx (list))
+(define (rs-entry name)
+  (cond ((equal? name "rk-checksum") leaf:checksum) ((equal? name "rk-hash") leaf:hash) ((equal? name "rk-dec") leaf:dec)
+        ((equal? name "rk-block-seek") leaf:block-seek) ((equal? name "rk-pad") leaf:pad) ((equal? name "rk-entry-encode") leaf:entry-encode)
+        ((equal? name "rk-wal-record") leaf:wal-record) ((equal? name "rk-block-build") leaf:block-build) ((equal? name "rk-bloom-build") leaf:bloom-build)
+        ((equal? name "rk-bloom-may") leaf:bloom-may) ((equal? name "rk-block-get") leaf:block-get) (else leaf:cache-sim)))
+(define (rs-c! name sym kinds ret samples probe cases shadow bench-arg reps)
+  (let ((only (list-ref rsink-ctx 1)) (floor-us (list-ref rsink-ctx 2))
+        (threshold (list-ref rsink-ctx 3)) (traj (list-ref rsink-ctx 4)) (csrc (list-ref rsink-ctx 5)))
+    (if (or (not only) (rs-in? name only))
+        (let* ((entry (rs-entry name))
+               (row (policy:sink-host! name csrc sym kinds ret (lambda (k) (leaf:install! name k)) (lambda (as) (apply entry as))
+                                       samples probe cases shadow bench-arg reps floor-us threshold traj)))
+          (policy:print row)
+          (set! rsink-rows (cons row rsink-rows))
+          row)
+        #f)))
+(define (rsink-coarse! plant s only floor-us threshold traj)
+    ; coarse hand-written kernels (kernels/rocks_leaves.c, lib/csink.aura in
+    ; aura-kernel-sink): a whole put-path record, a whole block / filter build,
+    ; a whole point lookup in a block, a whole cache-policy simulation
+    (let* ((blk (vector-ref s 0)) (keys (vector-ref s 3)) (nk (vector-length keys))
+           (bits (vector-ref s 4)) (nbits (vector-ref s 5)) (bk (vector-ref s 6))
+           (blob (vector-ref s 9)) (kblob (vector-ref s 10)) (trace (vector-ref s 11))
+           (v0 (rs-val 0)))
+      (rs-c! "rk-pad" "rk_pad" (list "I" "I") "S" (list 42 6) (lambda (j) (leaf:pad j 6))
+          (list 0 1 9 123456) (list (list 0 1) (list 42 6) (list 1234567 6) (list 5 0) (list 99 12)) 7 300)
+      (rs-c! "rk-entry-encode" "rk_entry_encode" (list "I" "S" "S") "S" (list 1 (vector-ref keys 3) v0)
+          (lambda (j) (leaf:entry-encode (modulo j 2) (vector-ref keys (modulo j nk)) v0))
+          (list 0 1 2 33) (list (list 1 (vector-ref keys 0) v0) (list 0 "" "") (list 1 "k" "") (list 0 "a" "bc")) 3 200)
+      (rs-c! "rk-wal-record" "rk_wal_record" (list "I" "S" "S") "S" (list 1 (vector-ref keys 3) v0)
+          (lambda (j) (leaf:wal-record (modulo j 2) (vector-ref keys (modulo j nk)) v0))
+          (list 0 1 2 33) (list (list 1 (vector-ref keys 0) v0) (list 0 "" "") (list 1 "k" "") (list 0 "a" "bc")) 3 200)
+      (rs-c! "rk-block-build" "rk_block_build" (list "S") "S" (list blob) (lambda (j) (leaf:block-build blob))
+          (list 0 1) (list (list blob) (list "") (list (entry:encode entry:put "a" "b"))) 1 20)
+      (rs-c! "rk-bloom-build" "rk_bloom_build" (list "S" "I") "S" (list kblob 10) (lambda (j) (leaf:bloom-build kblob 10))
+          (list 0 1) (list (list kblob 10) (list "" 10) (list "0001a" 1) (list kblob 3)) 1 6)
+      (rs-c! "rk-bloom-may" "rk_bloom_may" (list "S" "I" "I" "S") "I" (list bits nbits bk (vector-ref keys 3))
+          (lambda (j) (leaf:bloom-may bits nbits bk (rs-key (modulo (* j 13) 2000))))
+          (list 0 1 2 50 999 1500)
+          (list (list bits nbits bk (rs-key 0)) (list bits nbits bk (rs-key 1999)) (list bits nbits bk "") (list "o" 6 2 "a")) 3 200)
+      (rs-c! "rk-block-get" "rk_block_get" (list "S" "S") "S" (list blk (vector-ref keys 5))
+          (lambda (j) (leaf:block-get blk (vector-ref keys (modulo (* j 7) nk))))
+          (list 0 1 5 17 30)
+          (list (list blk (vector-ref keys 0)) (list blk "") (list blk "zzzz") (list blk "user0000")
+                (list blk (string-append (vector-ref keys 9) "0")) (list blk (vector-ref keys (- nk 1))))
+          7 200)
+      (rs-c! "rk-cache-sim" "rk_cache_sim" (list "I" "I" "S") "I" (list 0 64 trace) (lambda (j) (leaf:cache-sim (modulo j 3) 64 trace))
+          (list 0 1 2) (list (list 0 64 trace) (list 1 64 trace) (list 2 64 trace) (list 0 1 "a\nb\na") (list 1 2 "") (list 2 8 trace)) 2 6)))
+
+;; (name symbol kinds ret) of every kernel in kernels/rocks_leaves.c
+(define (rsink:kernels)
+  (list (list "rk-checksum" "rk_checksum" (list "S" "I" "I") "I") (list "rk-hash" "rk_hash_k" (list "S" "I") "I")
+        (list "rk-dec" "rk_dec" (list "S" "I" "I") "I") (list "rk-block-seek" "rk_block_seek" (list "S" "S" "I" "I") "I")
+        (list "rk-pad" "rk_pad" (list "I" "I") "S") (list "rk-entry-encode" "rk_entry_encode" (list "I" "S" "S") "S")
+        (list "rk-wal-record" "rk_wal_record" (list "I" "S" "S") "S") (list "rk-block-build" "rk_block_build" (list "S") "S")
+        (list "rk-bloom-build" "rk_bloom_build" (list "S" "I") "S") (list "rk-bloom-may" "rk_bloom_may" (list "S" "I" "I" "S") "I")
+        (list "rk-block-get" "rk_block_get" (list "S" "S") "S") (list "rk-cache-sim" "rk_cache_sim" (list "I" "I" "S") "I")))
+;; tests: build + load + install every kernel, no scoring (the "sink
+;; everything" configuration). Returns the names installed.
+(define (rsink:install-all!)
+  (let ((csrc (string-append (ru:root) "/kernels/rocks_leaves.c")))
+    (let loop ((ks (rsink:kernels)) (acc (list)))
+      (if (null? ks) (ru:rev acc)
+          (let* ((k (car ks)) (so (csink:build! csrc (list-ref k 1)))
+                 (f (if so (csink:load so (list-ref k 1) (list-ref k 2) (list-ref k 3)) #f)))
+            (if f (begin (leaf:install! (car k) f) (loop (cdr ks) (cons (car k) acc))) (loop (cdr ks) acc)))))))
 
 ; (keep rollback abort skip) over the rows of this process
 (define (rsink:summary)

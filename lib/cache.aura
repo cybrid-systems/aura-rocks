@@ -14,7 +14,9 @@
 ;   ring:  the last `ring-n` accessed keys (block access trace for the
 ;          controller's shadow simulation)
 (export cache:new cache:get cache:put! cache:policy cache:set-policy! cache:cap cache:count
-        cache:hits cache:misses cache:reset-stats! cache:trace cache:simulate cache:policies cache:clear!)
+        cache:hits cache:misses cache:reset-stats! cache:trace cache:simulate cache:simulate-trace cache:join cache:policies cache:clear!)
+
+(require "leaf" all:)
 
 (define (cache:policies) (list "lru" "lfu" "clock"))
 
@@ -103,10 +105,11 @@
               (vector-set! (vector-ref c 17) s (let ((f (cache-freq c key))) (if (> f 0) f 1)))
               s)))))
 
-; hits of `policy` with capacity `cap` replaying `keys` (list) on a cold cache
-(define (cache:simulate policy cap keys)
-  (let ((c (cache:new policy cap 0)))
-    (let loop ((ks keys))
-      (if (null? ks) (cache:hits c)
-          (begin (if (not (cache:get c (car ks))) (cache:put! c (car ks) #t) #t)
-                 (loop (cdr ks)))))))
+; hits of `policy` with capacity `cap` replaying `keys` (list) on a cold cache:
+; one coarse leaf (ws/hot.aura rk-cache-sim, same rules as above) over the
+; keys joined by newlines
+(define (cache-policy-code p) (cond ((equal? p "lfu") 1) ((equal? p "clock") 2) (else 0)))
+(define (cache:join keys) (cache-join keys))
+(define (cache-join keys) (if (null? keys) "" (apply string-append (cons (car keys) (map (lambda (k) (string-append "\n" k)) (cdr keys))))))
+(define (cache:simulate policy cap keys) (leaf:cache-sim (cache-policy-code policy) cap (cache-join keys)))
+(define (cache:simulate-trace policy cap trace) (leaf:cache-sim (cache-policy-code policy) cap trace))

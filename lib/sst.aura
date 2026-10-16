@@ -49,7 +49,7 @@
 ; entries: list of (type key val), strictly increasing keys, non-empty.
 ; Returns (path count size smallest largest).
 (define (sst:write path entries block-bytes bits-per-key)
-  (let loop ((es entries) (cur (list)) (cur-bytes 0) (last-key "") (off 0) (pieces (list)) (index (list)) (keys (list)) (count 0))
+  (let loop ((es entries) (cur (list)) (cur-bytes 0) (last-key "") (off 0) (pieces (list)) (index (list)) (keys (list)) (count 0) (kb (list)))
     (if (or (null? es) (>= cur-bytes block-bytes))
         ; flush the current block (if any)
         (let* ((sealed (if (null? cur) #f (sst-sealed (blk:build (ru:rev cur)))))
@@ -57,17 +57,17 @@
                (index2 (if sealed (cons (string-append (ru:pad (string-length last-key) 4) last-key (ru:pad off 12) (ru:pad (string-length sealed) 8)) index) index))
                (off2 (if sealed (+ off (string-length sealed)) off)))
           (if (not (null? es))
-              (loop es (list) 0 last-key off2 pieces2 index2 keys count)
+              (loop es (list) 0 last-key off2 pieces2 index2 keys count kb)
               (let* ((rkeys (ru:rev keys))
                      (smallest (car rkeys)) (largest last-key)
                      (idx (sst-sealed (ru:concat (append (list (ru:pad (string-length smallest) 4) smallest (ru:pad (string-length largest) 4) largest (ru:pad (ru:len index2) 8)) (ru:rev index2)))))
-                     (flt (sst-sealed (bloom:build rkeys bits-per-key)))
+                     (flt (sst-sealed (bloom:build-blob (ru:concat (ru:rev kb)) bits-per-key)))
                      (footer (string-append (ru:pad off2 12) (ru:pad (string-length idx) 12) (ru:pad (+ off2 (string-length idx)) 12) (ru:pad (string-length flt) 12) (ru:pad count 12) sst-magic))
                      (data (ru:concat (append (ru:rev pieces2) (list idx flt footer)))))
                 (rio:write path data)
                 (list path count (string-length data) smallest largest))))
         (let* ((e (car es)) (enc (entry:encode (car e) (car (cdr e)) (car (cdr (cdr e))))))
-          (loop (cdr es) (cons enc cur) (+ cur-bytes (string-length enc) 6) (car (cdr e)) off pieces index (cons (car (cdr e)) keys) (+ count 1))))))
+          (loop (cdr es) (cons enc cur) (+ cur-bytes (string-length enc) 6) (car (cdr e)) off pieces index (cons (car (cdr e)) keys) (+ count 1) (cons (string-append (substring enc 1 5) (car (cdr e))) kb))))))
 
 ; string-ref/substring cost grows with the index even on ASCII strings
 ; (aura#4548), so open cuts the file once into the footer, index, filter and
@@ -147,10 +147,9 @@
           (begin (sst-bump! 1) #f)
           (let ((bi (sst-find-block t key)))
             (if (>= bi (vector-ref t 5)) #f
-                (let* ((b (sst-block t bi)) (n (blk:count b)) (ra (blk:ra b n)) (i (blk:seek b key n ra)))
-                  (if (>= i n) #f
-                      (let ((off (blk:off b ra i)))
-                        (if (string=? (blk:key b off) key) (cons (blk:type b off) (blk:val b off)) #f)))))))))
+                ; one coarse leaf (ws/hot.aura rk-block-get): seek + compare + value
+                (let ((r (leaf:block-get (sst-block t bi) key)))
+                  (if (= (string-length r) 0) #f (cons (string-ref r 0) (substring r 1 (string-length r))))))))))
 
 ; ---- iterator
 (define (sst:iter t) (vector t (vector-ref t 5) "" 0 0 0))

@@ -11,11 +11,8 @@
 (require "entry" all:)
 
 ; encoded: list of entry strings in key order -> block string
-(define (blk:build encoded)
-  (let loop ((es encoded) (off 0) (n 0) (offs (list)))
-    (if (null? es)
-        (ru:concat (append encoded (ru:rev offs) (list (ru:pad n 6))))
-        (loop (cdr es) (+ off (string-length (car es))) (+ n 1) (cons (ru:pad off 6) offs)))))
+;; one coarse leaf (ws/hot.aura rk-block-build) over the entries back to back
+(define (blk:build encoded) (leaf:block-build (ru:concat encoded)))
 
 (define (blk:count b) (leaf:dec b (- (string-length b) 6) 6))
 (define (blk:ra b n) (- (string-length b) 6 (* 6 n)))

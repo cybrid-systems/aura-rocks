@@ -15,10 +15,8 @@
 (define entry:max-key 9999)
 (define entry:max-val 999999)
 
-(define (entry:encode type key val)
-  (if (> (string-length key) entry:max-key) (ru:fail "key longer than " (number->string entry:max-key)) #f)
-  (if (> (string-length val) entry:max-val) (ru:fail "value longer than " (number->string entry:max-val)) #f)
-  (string-append (if (= type entry:del) "D" "P") (ru:pad (string-length key) 4) (ru:pad (string-length val) 6) key val))
+;; one coarse leaf (ws/hot.aura rk-entry-encode): length checks + header + key + value
+(define (entry:encode type key val) (leaf:entry-encode type key val))
 
 (define (entry:type-at s off) (string-ref s off))
 (define (entry:klen-at s off) (leaf:dec s (+ off 1) 4))

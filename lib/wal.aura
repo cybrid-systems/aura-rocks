@@ -11,9 +11,8 @@
 (require "rio" all:)
 (require "entry" all:)
 
-(define (wal:record type key val)
-  (let ((p (entry:encode type key val)))
-    (string-append "R" (ru:pad (string-length p) 8) (ru:pad (leaf:checksum p 0 (string-length p)) 10) p)))
+;; one coarse leaf (ws/hot.aura rk-wal-record): encode + Adler-32 + framing
+(define (wal:record type key val) (leaf:wal-record type key val))
 
 (define (wal:append! path type key val sync)
   (rio:append! path (wal:record type key val) sync))

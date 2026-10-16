@@ -5,7 +5,7 @@
 ; 17-bit rotation, as in RocksDB's legacy bloom. Probing is the hot leaf
 ; rk-bloom-probe; building sets bits with quotient/modulo (Aura has no
 ; bitwise ops).
-(export bloom:build bloom:may? bloom:parse bloom:bits-per-key)
+(export bloom:build bloom:build-blob bloom:keyblob bloom:may? bloom:parse bloom:bits-per-key)
 (require "leaf" all:)
 (require "ru" all:)
 
@@ -15,31 +15,15 @@
 (define (bloom-pow2 b) (if (= b 0) 1 (if (= b 1) 2 (if (= b 2) 4 (if (= b 3) 8 (if (= b 4) 16 32))))))
 
 ; keys: list of strings. Returns the filter string.
-(define (bloom:build keys bpk)
-  (let* ((nkeys (ru:len keys))
-         (nbits (ru:max 64 (* nkeys bpk)))
-         (nchars (quotient (+ nbits 5) 6))
-         (v (make-vector nchars 0))
-         (k (bloom-k bpk)))
-    (let each ((ks keys))
-      (if (null? ks) #t
-          (let ((h (leaf:hash (car ks) 0)))
-            (let probe ((i 0) (p (modulo h nbits)) (d (+ (quotient h 131072) (* (modulo h 131072) 32768))))
-              (if (< i k)
-                  (let* ((ci (quotient p 6)) (bit (bloom-pow2 (modulo p 6))) (cur (vector-ref v ci)))
-                    (if (= (modulo (quotient cur bit) 2) 0) (vector-set! v ci (+ cur bit)) #f)
-                    (probe (+ i 1) (modulo (+ p d) nbits) d))
-                  #t))
-            (each (cdr ks)))))
-    (let loop ((i (- nchars 1)) (acc (list)))
-      (if (< i 0)
-          (string-append (ru:pad nbits 10) (ru:pad k 2) (list->string acc))
-          (loop (- i 1) (cons (integer->char (+ 48 (vector-ref v i))) acc))))))
+; keyblob: klen(4) key per key, back to back
+(define (bloom:keyblob keys) (ru:concat (map (lambda (k) (string-append (leaf:pad (string-length k) 4) k)) keys)))
+;; one coarse leaf (ws/hot.aura rk-bloom-build): hash + k probes per key
+(define (bloom:build keys bpk) (leaf:bloom-build (bloom:keyblob keys) bpk))
+(define (bloom:build-blob keyblob bpk) (leaf:bloom-build keyblob bpk))
 
-; filter string -> (bits nbits k)
 (define (bloom:parse f)
   (list (substring f 12 (string-length f)) (leaf:dec f 0 10) (leaf:dec f 10 2)))
 
 ; parsed: (bits nbits k)
 (define (bloom:may? parsed key)
-  (= 1 (leaf:bloom-probe (car parsed) (car (cdr parsed)) (leaf:hash key 0) (car (cdr (cdr parsed))))))
+  (= 1 (leaf:bloom-may (car parsed) (car (cdr parsed)) (car (cdr (cdr parsed))) key)))

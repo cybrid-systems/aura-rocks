@@ -298,7 +298,8 @@
            (let ((tr (cache:trace c)))
              (if (< (ru:len tr) 128) #f
                  (let* ((cur (adapt:knob "cache_policy"))
-                        (sims (map (lambda (p) (cons p (cache:simulate p (cache:cap c) tr))) (cache:policies)))
+                        (tj (cache:join tr))
+                        (sims (map (lambda (p) (cons p (cache:simulate-trace p (cache:cap c) tj))) (cache:policies)))
                         (hc (cdr (assoc cur sims)))
                         (best (let loop ((ss sims) (b (cons cur hc))) (cond ((null? ss) b) ((> (cdr (car ss)) (cdr b)) (loop (cdr ss) (car ss))) (else (loop (cdr ss) b)))))
                         (gain (/ (* 1.0 (+ 1 (cdr best))) (+ 1 hc)))
