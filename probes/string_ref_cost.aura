@@ -1,0 +1,6 @@
+(define big (list->string (let l ((k 0) (acc (list))) (if (< k 270000) (l (+ k 1) (cons #\a acc)) acc))))
+(define (refs s off n) (let l ((i 0) (acc 0)) (if (< i n) (l (+ i 1) (+ acc (char->integer (string-ref s (+ off i))))) acc)))
+(define t0 (current-time-ms)) (refs big 0 2000) (display (list "ref@0 x2000 ms" (- (current-time-ms) t0))) (newline)
+(set! t0 (current-time-ms)) (refs big 260000 2000) (display (list "ref@260000 x2000 ms" (- (current-time-ms) t0))) (newline)
+(set! t0 (current-time-ms)) (let l ((i 0)) (if (< i 200) (begin (substring big 0 4096) (l (+ i 1))) #t)) (display (list "substr@0 x200 ms" (- (current-time-ms) t0))) (newline)
+(set! t0 (current-time-ms)) (let l ((i 0)) (if (< i 200) (begin (substring big 260000 264096) (l (+ i 1))) #t)) (display (list "substr@260000 x200 ms" (- (current-time-ms) t0))) (newline)
