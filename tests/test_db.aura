@@ -10,9 +10,14 @@
 (display "RUN-ONCE") (newline)
 (define dir (string-append (ru:root) "/build/test-db"))
 (db:destroy! dir)
+; memtable rep under test: $ROCKS_TEST_REP (scripts/run_tests.sh runs this
+; file once per rep: skiplist, vector, hash)
+(define REP (let ((r (getenv "ROCKS_TEST_REP"))) (if (and (string? r) (> (string-length r) 0)) r "skiplist")))
+(display (string-append "memtable rep " REP)) (newline)
 ; small sizes so a few hundred keys exercise flush + compaction
 (define (opts) (list (cons "memtable_bytes" 2500) (cons "l0_trigger" 3) (cons "target_file_bytes" 8000)
-                     (cons "block_bytes" 1024) (cons "bloom_bits" 10) (cons "sync" #f) (cons "auto_compact" #t)))
+                     (cons "block_bytes" 1024) (cons "bloom_bits" 10) (cons "sync" #f) (cons "auto_compact" #t)
+                     (cons "memtable_rep" REP) (cons "prefix_len" 7)))
 (define db (db:open dir (opts)))
 (define (stat name) (let loop ((s (db:stats db))) (cond ((null? s) #f) ((equal? (car (car s)) name) (cdr (car s))) (else (loop (cdr s))))))
 
@@ -40,6 +45,7 @@
 (display "stats: ") (display (db:stats db)) (newline)
 (expect "flushes happened" (> (stat "flushes") 2))
 (expect "compaction happened" (> (stat "compactions") 0))
+(expect (string-append "memtable rep is " REP) (equal? (stat "mem_rep") REP))
 (define (check-all! label)
   (let loop ((i 0) (bad 0))
     (if (< i NK)
@@ -76,5 +82,13 @@
 (rio:append! (db:wal-path db) "R0000" #f)
 (set! db (db:open dir (opts)))
 (expect "torn WAL tail ignored, earlier record kept" (equal? (db:get db (key 1)) "last-good"))
+; live migration of the memtable to every other rep keeps every answer
+(let loop ((n 650)) (if (< n 700) (begin (apply-op! n) (loop (+ n 1))) #t))
+(let each ((rs (list "skiplist" "vector" "hash" REP)))
+  (if (null? rs) #t
+      (begin (db:migrate-mem! db (car rs))
+             (check-all! (string-append "after live migrate to " (car rs)))
+             (expect (string-append "scan after live migrate to " (car rs)) (equal? (db:scan db "" #f #f) (oracle-pairs 0 NK)))
+             (each (cdr rs)))))
 (expect "only 7-bit files on disk" (let loop ((fs (rio:list dir))) (cond ((null? fs) #t) ((ru:ascii? (rio:read (string-append dir "/" (car fs)))) (loop (cdr fs))) (else #f))))
 (expect "checks all passed" (expect-summary))

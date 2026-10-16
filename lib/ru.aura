@@ -1,5 +1,5 @@
 ; lib/ru.aura — small helpers shared by the engine (no std list closures).
-(export ru:pad ru:concat ru:rev ru:len ru:root ru:path ru:fail ru:max ru:min ru:ascii?)
+(export ru:pad ru:concat ru:rev ru:len ru:root ru:path ru:fail ru:max ru:min ru:ascii? ru:sort-idx)
 
 ; n as a zero-padded decimal field of width w (n >= 0, fits in w digits).
 (define (ru:pad n w)
@@ -27,3 +27,24 @@
 (define (ru:ascii? s)
   (let ((n (string-length s)))
     (let loop ((i 0)) (cond ((>= i n) #t) ((> (string-ref s i) 127) #f) (else (loop (+ i 1)))))))
+
+; Indices 0..n-1 of the string vector keys, sorted by key, stable (equal keys
+; keep insertion order). Bottom-up merge sort: std/list sort silently returns
+; () for a list of strings (aura#4549).
+(define (ru-merge! keys src dst lo mid hi)
+  (let loop ((i lo) (j mid) (k lo))
+    (cond ((>= k hi) #t)
+          ((and (< j hi) (or (>= i mid) (string<? (vector-ref keys (vector-ref src j)) (vector-ref keys (vector-ref src i)))))
+           (vector-set! dst k (vector-ref src j)) (loop i (+ j 1) (+ k 1)))
+          (else (vector-set! dst k (vector-ref src i)) (loop (+ i 1) j (+ k 1))))))
+(define (ru:sort-idx keys n)
+  (let ((a (make-vector n 0)) (b (make-vector n 0)))
+    (let fill ((i 0)) (if (< i n) (begin (vector-set! a i i) (fill (+ i 1))) #t))
+    (let pass ((w 1) (src a) (dst b))
+      (if (>= w n) src
+          (begin
+            (let run ((lo 0))
+              (if (< lo n)
+                  (begin (ru-merge! keys src dst lo (ru:min (+ lo w) n) (ru:min (+ lo (* 2 w)) n)) (run (+ lo (* 2 w))))
+                  #t))
+            (pass (* 2 w) dst src))))))

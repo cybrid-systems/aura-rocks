@@ -1,33 +1,33 @@
 ; lib/merge.aura — merging iterator over sorted sources, newest first.
 ;
 ; A source is a memtable cursor or an SST iterator:
-;   #("mt" memtable node)   or   #("sst" sst-iter)
+;   #("mt" mem-cursor)   or   #("sst" sst-iter)   (lib/mem.aura cursor, any rep)
 ; Sources are given newest first (memtable, L0 newest..oldest, L1...). For a
 ; key present in several sources the newest wins; the others are skipped.
 ; Tombstones are returned (type "D"); callers drop them (reads) or keep them
 ; (compaction into a non-bottom level).
-(export merge:new merge:seek! merge:first! merge:next-entry! merge:mt-source merge:sst-source)
+(export merge:new merge:seek! merge:first! merge:next-entry! merge:mem-source merge:sst-source)
 (require "ru" all:)
-(require "memtable" all:)
+(require "mem" all:)
 (require "sst" all:)
 
-(define (merge:mt-source m) (vector "mt" m -1))
+(define (merge:mem-source m) (vector "mt" (mem:cursor m)))
 (define (merge:sst-source t) (vector "sst" (sst:iter t)))
 
 (define (src-valid? s)
-  (if (equal? (vector-ref s 0) "mt") (>= (vector-ref s 2) 0) (sst:iter-valid? (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-valid? (vector-ref s 1)) (sst:iter-valid? (vector-ref s 1))))
 (define (src-key s)
-  (if (equal? (vector-ref s 0) "mt") (mt:key (vector-ref s 1) (vector-ref s 2)) (sst:iter-key (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-key (vector-ref s 1)) (sst:iter-key (vector-ref s 1))))
 (define (src-type s)
-  (if (equal? (vector-ref s 0) "mt") (mt:type (vector-ref s 1) (vector-ref s 2)) (sst:iter-type (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-type (vector-ref s 1)) (sst:iter-type (vector-ref s 1))))
 (define (src-val s)
-  (if (equal? (vector-ref s 0) "mt") (mt:val (vector-ref s 1) (vector-ref s 2)) (sst:iter-val (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-val (vector-ref s 1)) (sst:iter-val (vector-ref s 1))))
 (define (src-next! s)
-  (if (equal? (vector-ref s 0) "mt") (vector-set! s 2 (mt:next (vector-ref s 1) (vector-ref s 2))) (sst:iter-next! (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-next! (vector-ref s 1)) (sst:iter-next! (vector-ref s 1))))
 (define (src-seek! s key)
-  (if (equal? (vector-ref s 0) "mt") (vector-set! s 2 (mt:seek (vector-ref s 1) key)) (sst:iter-seek! (vector-ref s 1) key)))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-seek! (vector-ref s 1) key) (sst:iter-seek! (vector-ref s 1) key)))
 (define (src-first! s)
-  (if (equal? (vector-ref s 0) "mt") (vector-set! s 2 (mt:first (vector-ref s 1))) (sst:iter-first! (vector-ref s 1))))
+  (if (equal? (vector-ref s 0) "mt") (mem:cur-first! (vector-ref s 1)) (sst:iter-first! (vector-ref s 1))))
 
 ; sources: list (newest first) -> merger = vector of sources
 (define (merge:new sources) (list->vector sources))

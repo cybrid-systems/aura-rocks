@@ -10,17 +10,19 @@
 ; Levels: L0 (overlapping, newest first) and L1 (sorted, non-overlapping,
 ; bottommost: compaction drops tombstones and overwritten versions).
 ;
-; db = #(dir mem wal-num next-file levels opts stats obs)
+; db = #(dir mem wal-num next-file levels opts stats obs hook)
+; hook: #f or (lambda (db event)) called at decision points: "rotate" (before
+; the next memtable is created at a flush) and "window" (observer window closed)
 ; obs: lib/obs.aura workload observer (every put/delete/get/scan is recorded)
 (export db:open db:put! db:delete! db:get db:scan db:flush! db:compact! db:close
-        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs)
+        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs db:mem-rep db:migrate-mem! db:set-hook!)
 (require "leaf" all:)
 (require "ru" all:)
 (require "rio" all:)
 (require "hot" all:)
 (require "entry" all:)
 (require "wal" all:)
-(require "memtable" all:)
+(require "mem" all:)
 (require "sst" all:)
 (require "merge" all:)
 (require "obs" all:)
@@ -34,7 +36,9 @@
         (cons "bloom_bits" 10)            ; bits per key, 0 = no filter checks
         (cons "sync" #f)                  ; fdatasync every WAL append
         (cons "auto_compact" #t)
-        (cons "obs_window" 200)))         ; ops per observer window
+        (cons "obs_window" 200)           ; ops per observer window
+        (cons "memtable_rep" #f)          ; "skiplist" "vector" "hash", or #f: ask the workspace (rk-memtable-rep)
+        (cons "prefix_len" 12)))          ; hash rep: bucket key prefix length
 (define (db-opt-in opts key)
   (cond ((null? opts) (ru:fail "unknown option " key)) ((equal? (car (car opts)) key) (cdr (car opts))) (else (db-opt-in (cdr opts) key))))
 (define (db-opt-set opts key v)
@@ -42,10 +46,22 @@
 (define (db:opt db key) (db-opt-in (vector-ref db 5) key))
 (define (db-opt-or db key dflt) (let loop ((o (vector-ref db 5))) (cond ((null? o) dflt) ((equal? (car (car o)) key) (cdr (car o))) (else (loop (cdr o))))))
 (define (db:obs db) (vector-ref db 7))
+(define (db:set-hook! db f) (vector-set! db 8 f) #t)
+(define (db-hook! db event) (if (vector-ref db 8) ((vector-ref db 8) db event) #f))
+; after every op: a closed observer window is a decision point
+(define (db-after-op! db)
+  (let ((o (vector-ref db 7)))
+    (if (obs:closed! o) (begin (obs:reset-closed! o) (db-hook! db "window")) #f)))
+; rep for the next memtable: the fixed option, else the workspace define the
+; controller hot-swaps (lib/adapt.aura)
+(define (db:mem-rep db) (let ((r (db-opt-or db "memtable_rep" #f))) (if r r (leaf:memtable-rep))))
+(define (db-new-mem db) (mem:new (db:mem-rep db) (db-opt-or db "prefix_len" 12)))
+; switch the live memtable to rep now (copy), instead of at the next rotation
+(define (db:migrate-mem! db rep) (vector-set! db 1 (mem:migrate (vector-ref db 1) rep (db-opt-or db "prefix_len" 12))) rep)
 (define (db:set-opt! db key v) (vector-set! db 5 (db-opt-set (vector-ref db 5) key v)) v)
 
 ; ---- stats
-(define db-stat-names (list "puts" "deletes" "gets" "scans" "flushes" "compactions" "wal_bytes" "sst_bytes_written" "compaction_bytes_in" "compaction_bytes_out" "wal_records_replayed"))
+(define db-stat-names (list "puts" "deletes" "gets" "scans" "flushes" "compactions" "wal_bytes" "sst_bytes_written" "compaction_bytes_in" "compaction_bytes_out" "wal_records_replayed" "compaction_ms" "flush_ms"))
 (define (db-stat-index name)
   (let loop ((ns db-stat-names) (i 0)) (cond ((null? ns) (ru:fail "unknown stat " name)) ((equal? (car ns) name) i) (else (loop (cdr ns) (+ i 1))))))
 (define (db-bump! db name n)
@@ -55,7 +71,7 @@
 (define (db:stats db)
   (let loop ((ns db-stat-names) (i 0) (acc (list)))
     (if (null? ns) (append (ru:rev acc) (list (cons "l0_files" (ru:len (db:level-files db 0))) (cons "l1_files" (ru:len (db:level-files db 1)))
-                                               (cons "mem_entries" (mt:count (vector-ref db 1))) (cons "io" (rio:mode))) (sst:stats))
+                                               (cons "mem_entries" (mem:count (vector-ref db 1))) (cons "mem_rep" (mem:rep (vector-ref db 1))) (cons "io" (rio:mode))) (sst:stats))
         (loop (cdr ns) (+ i 1) (cons (cons (car ns) (vector-ref (vector-ref db 6) i)) acc)))))
 
 (define (db:dir db) (vector-ref db 0))
@@ -100,15 +116,16 @@
   (rio:mkdir! dir)
   (let* ((ms (rio:read (ru:path dir "MANIFEST")))
          (m (if ms (db-parse-manifest ms) (list 1 0 (list) (list))))
-         (db (vector dir (mt:new) 0 (car m) (vector (list) (list)) (if opts opts (db:options)) (make-vector (ru:len db-stat-names) 0) #f))
+         (db (vector dir #f 0 (car m) (vector (list) (list)) (if opts opts (db:options)) (make-vector (ru:len db-stat-names) 0) #f #f))
          (open-all (lambda (nums) (let loop ((ns nums) (acc (list))) (if (null? ns) (ru:rev acc) (loop (cdr ns) (cons (sst:open (db-file db (car ns) ".sst")) acc)))))))
     (vector-set! db 7 (obs:new (db-opt-or db "obs_window" 200)))
+    (vector-set! db 1 (db-new-mem db))
     (vector-set! (vector-ref db 4) 0 (open-all (car (cdr (cdr m)))))
     (vector-set! (vector-ref db 4) 1 (open-all (car (cdr (cdr (cdr m))))))
     (if (and ms (> (car (cdr m)) 0))
         (begin
           (vector-set! db 2 (car (cdr m)))
-          (let ((r (wal:replay (db:wal-path db) (lambda (type key val) (mt:put! (vector-ref db 1) key type val)))))
+          (let ((r (wal:replay (db:wal-path db) (lambda (type key val) (mem:put! (vector-ref db 1) key type val)))))
             (db-bump! db "wal_records_replayed" (car r))))
         (begin
           (vector-set! db 2 (db-new-file-num! db))
@@ -122,28 +139,31 @@
 (define (db-write! db type key val)
   (if (= (string-length key) 0) (ru:fail "empty key") #f)
   (db-bump! db "wal_bytes" (wal:append! (db:wal-path db) type key val (db:opt db "sync")))
-  (mt:put! (vector-ref db 1) key type val)
-  (if (>= (mt:bytes (vector-ref db 1)) (db:opt db "memtable_bytes")) (db:flush! db) #f)
+  (mem:put! (vector-ref db 1) key type val)
+  (if (>= (mem:bytes (vector-ref db 1)) (db:opt db "memtable_bytes")) (db:flush! db) #f)
   #t)
 (define (db:put! db key val)
   (let ((t0 (current-time-ms)))
     (db-bump! db "puts" 1) (db-write! db entry:put key val)
-    (obs:put! (vector-ref db 7) key #f (+ (string-length key) (string-length val)) (- (current-time-ms) t0))))
+    (obs:put! (vector-ref db 7) key #f (+ (string-length key) (string-length val)) (- (current-time-ms) t0))
+    (db-after-op! db)))
 (define (db:delete! db key)
   (let ((t0 (current-time-ms)))
     (db-bump! db "deletes" 1) (db-write! db entry:del key "")
-    (obs:put! (vector-ref db 7) key #t (string-length key) (- (current-time-ms) t0))))
+    (obs:put! (vector-ref db 7) key #t (string-length key) (- (current-time-ms) t0))
+    (db-after-op! db)))
 
 (define (db:flush! db)
   (let ((m (vector-ref db 1)))
-    (if (= (mt:count m) 0) #f
+    (if (= (mem:count m) 0) #f
         (let* ((num (db-new-file-num! db))
-               (meta (sst:write (db-file db num ".sst") (mt:entries m) (db:opt db "block_bytes") (db:opt db "bloom_bits")))
+               (meta (sst:write (db-file db num ".sst") (mem:entries m) (db:opt db "block_bytes") (db:opt db "bloom_bits")))
                (old-wal (db:wal-path db)))
           (db-bump! db "flushes" 1)
           (db-bump! db "sst_bytes_written" (car (cdr (cdr meta))))
           (vector-set! (vector-ref db 4) 0 (cons (sst:open (car meta)) (db:level-files db 0)))
-          (vector-set! db 1 (mt:new))
+          (db-hook! db "rotate")
+          (vector-set! db 1 (db-new-mem db))
           (vector-set! db 2 (db-new-file-num! db))
           (db-write-manifest! db)
           (rio:unlink! old-wal)
@@ -169,6 +189,10 @@
   (db-bump! db "compactions" 1)
   #t)
 (define (db:compact! db)
+  (let* ((t0 (current-time-ms)) (r (db-compact-all! db)))
+    (db-bump! db "compaction_ms" (- (current-time-ms) t0))
+    r))
+(define (db-compact-all! db)
   (let* ((l0 (db:level-files db 0)) (l1 (db:level-files db 1)) (inputs (append l0 l1)))
     (if (null? l0) #f
         (let ((mg (merge:first! (merge:new (let loop ((ts inputs) (acc (list))) (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc)))))))
@@ -194,9 +218,9 @@
 (define (db-resolve hit) (if (and hit (= (car hit) entry:put)) (cdr hit) #f))
 ; -> #(value level probes): level "mem" "l0" "l1" or #f
 (define (db-get-full db key)
-  (let* ((m (vector-ref db 1)) (x (mt:get m key)) (use-bloom (> (db:opt db "bloom_bits") 0)))
+  (let* ((x (mem:get (vector-ref db 1) key)) (use-bloom (> (db:opt db "bloom_bits") 0)))
     (if x
-        (vector (if (= (mt:type m x) entry:put) (mt:val m x) #f) "mem" 0)
+        (vector (db-resolve x) "mem" 0)
         (let l0 ((ts (db:level-files db 0)) (probes 0))
           (if (null? ts)
               (let ((r (db-l1-get db key use-bloom)))
@@ -207,6 +231,7 @@
   (db-bump! db "gets" 1)
   (let* ((t0 (current-time-ms)) (r (db-get-full db key)))
     (obs:get! (vector-ref db 7) key (vector-ref r 1) (if (vector-ref r 0) #t #f) (vector-ref r 2) (- (current-time-ms) t0))
+    (db-after-op! db)
     (vector-ref r 0)))
 
 ; Live (key . val) pairs with start <= key < end (end #f: unbounded), at most limit.
@@ -214,9 +239,10 @@
   (db-bump! db "scans" 1)
   (let* ((t0 (current-time-ms)) (r (db-scan db start end limit)))
     (obs:scan! (vector-ref db 7) start (ru:len r) (- (current-time-ms) t0))
+    (db-after-op! db)
     r))
 (define (db-scan db start end limit)
-  (let ((mg (merge:seek! (merge:new (cons (merge:mt-source (vector-ref db 1))
+  (let ((mg (merge:seek! (merge:new (cons (merge:mem-source (vector-ref db 1))
                                           (let loop ((ts (append (db:level-files db 0) (db:level-files db 1))) (acc (list)))
                                             (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc))))))
                          start)))

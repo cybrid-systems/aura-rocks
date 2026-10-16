@@ -1,0 +1,265 @@
+; lib/adapt.aura — runtime structure adaptation, the Aura way.
+;
+; The engine reads its structure policy from workspace defines (ws/hot.aura:
+; rk-memtable-rep, rk-compaction-style, rk-l0-trigger, rk-max-runs). This
+; controller watches the workload (lib/obs.aura) and, at a decision point,
+; hot-swaps one define with mutate:rebind:
+;
+;   1. policy   pick a candidate from the observed features (thresholds from
+;               an aura-loop proposal, ADAPT_PROPOSAL json, or defaults); no
+;               change -> no row
+;   2. gate     memtable rep: shadow-replay the last ops (observer trace) on a
+;               fresh memtable of the current and of the candidate rep, compare
+;               every answer (mismatch -> ABORT) and time both (candidate must
+;               be >= min_speedup faster, else REJECT: nothing is swapped)
+;   3. swap     mutate:rebind + eval-current; the next memtable (rotation
+;               boundary) or, with live_migrate, the current one uses it
+;   4. post     at the next decision point, compare the observed cost per op
+;               after the swap with the cost before; a regression beyond
+;               max_regress with a similar workload -> ROLLBACK (rebind the
+;               old body back), else KEEP with the realized speedup
+;
+; Every decision is one JSON line (trajectory) with the state features, the
+; action, the measured speedup and a reward; aura-loop ingests these
+; (aura_loop/adapt_ingest.py) and learns the thresholds — the engine itself
+; only follows the rule policy it is given.
+(export adapt:overhead-ms adapt:new adapt:attach! adapt:tick! adapt:rows adapt:summary adapt:json adapt:set-knob! adapt:knob adapt:set-param! adapt:params)
+(require "ru" all:)
+(require "rio" all:)
+(require "leaf" all:)
+(require "entry" all:)
+(require "obs" all:)
+(require "mem" all:)
+(require "db" all:)
+
+; ---- JSON
+(define (aj-str s)
+  (let loop ((i 0) (start 0) (acc "\""))
+    (if (>= i (string-length s)) (string-append acc (substring s start i) "\"")
+        (let ((c (string-ref s i)))
+          (cond ((= c 34) (loop (+ i 1) (+ i 1) (string-append acc (substring s start i) "\\\"")))
+                ((= c 92) (loop (+ i 1) (+ i 1) (string-append acc (substring s start i) "\\\\")))
+                (else (loop (+ i 1) start acc)))))))
+(define (aj-val v)
+  (cond ((equal? v #t) "true") ((equal? v #f) "false") ((string? v) (aj-str v)) ((number? v) (number->string v))
+        ((null? v) "{}")
+        ((and (pair? v) (pair? (car v)) (string? (car (car v)))) (adapt:json v))
+        ((pair? v) (let loop ((xs v) (acc "[") (first #t)) (if (null? xs) (string-append acc "]") (loop (cdr xs) (string-append acc (if first "" ",") (aj-val (car xs))) #f))))
+        (else "null")))
+(define (adapt:json row)
+  (let loop ((xs row) (acc "{") (first #t))
+    (if (null? xs) (string-append acc "}")
+        (loop (cdr xs) (string-append acc (if first "" ",") (aj-str (car (car xs))) ":" (aj-val (cdr (car xs)))) #f))))
+
+; ---- proposal (thresholds): defaults, overridden by ADAPT_PROPOSAL json
+(define (adapt-defaults)
+  (list (cons "mem_write_hi" 0.9)      ; write share at or above: vector rep (bulk load)
+        (cons "mem_scan_hi" 0.15)      ; scan share at or above: skiplist (ordered)
+        (cons "mem_read_hi" 0.5)       ; point-read share at or above (few scans): hash rep
+        (cons "mem_min_speedup" 1.15)  ; shadow replay gate
+        (cons "cmp_write_hi" 0.7)      ; write share at or above: tiered compaction
+        (cons "cmp_read_hi" 0.5)       ; read+scan share at or above: leveled compaction
+        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 2) (cons "max_runs" 4)
+        (cons "max_regress" 1.15)      ; post check: cost after / before above this -> rollback
+        (cons "similar" 0.2)           ; post check only when the op mix moved less than this
+        (cons "cooldown" 2)            ; decision points to wait after a rollback / reject
+        (cons "cmp_periods" 4)))       ; rotations a compaction switch is judged over
+(define (adapt-load-proposal)
+  (let ((p (getenv "ADAPT_PROPOSAL")))
+    (if (and (string? p) (> (string-length p) 0))
+        (let ((txt (rio:read p)))
+          (if (string? txt)
+              (let ((h (json-parse txt)))
+                (let loop ((ds (adapt-defaults)) (acc (list)))
+                  (if (null? ds) (ru:rev acc)
+                      (loop (cdr ds) (cons (cons (car (car ds)) (hash-ref h (car (car ds)) (cdr (car ds)))) acc)))))
+              (ru:fail "cannot read ADAPT_PROPOSAL " p)))
+        (adapt-defaults))))
+
+; ctl = #(params traj-path rows knobs pending cooldowns label live periods last-ms last-ops last-cmp-ms nperiods)
+; knobs: list of enabled knobs ("memtable_rep", "compaction")
+; pending: list of #(knob "" from to period-at-swap feats restore needed-periods)
+; periods: newest first, #(wall-ms ops compaction-ms) between two decision points
+(define (adapt:new traj-path knobs live)
+  (vector (adapt-load-proposal) traj-path (list) knobs (list) (list) "" live (list) (current-time-ms) 0 0 0 0))
+; ms the controller itself spent (gate replays, rebinds, live migrations); kept
+; out of the measured periods, but it is part of the db's wall time
+(define (adapt:overhead-ms ctl) (vector-ref ctl 13))
+(define (ap ctl k) (let loop ((ps (vector-ref ctl 0))) (cond ((null? ps) (ru:fail "adapt: no param " k)) ((equal? (car (car ps)) k) (cdr (car ps))) (else (loop (cdr ps))))))
+(define (adapt:params ctl) (vector-ref ctl 0))
+(define (adapt:set-param! ctl k v)
+  (vector-set! ctl 0 (let loop ((ps (vector-ref ctl 0)) (acc (list))) (if (null? ps) (ru:rev acc) (loop (cdr ps) (cons (if (equal? (car (car ps)) k) (cons k v) (car ps)) acc))))) v)
+(define (adapt:rows ctl) (ru:rev (vector-ref ctl 2)))
+(define (knob-on? ctl k) (let loop ((ks (vector-ref ctl 3))) (cond ((null? ks) #f) ((equal? (car ks) k) #t) (else (loop (cdr ks))))))
+
+; knob -> workspace define and its current value
+(define (knob-define k)
+  (cond ((equal? k "memtable_rep") "rk-memtable-rep") ((equal? k "compaction_style") "rk-compaction-style")
+        ((equal? k "l0_trigger") "rk-l0-trigger") ((equal? k "max_runs") "rk-max-runs") (else (ru:fail "adapt: unknown knob " k))))
+(define (adapt:knob k)
+  (cond ((equal? k "memtable_rep") (leaf:memtable-rep)) ((equal? k "compaction_style") (leaf:compaction-style))
+        ((equal? k "l0_trigger") (leaf:l0-trigger)) ((equal? k "max_runs") (leaf:max-runs)) (else (ru:fail "adapt: unknown knob " k))))
+(define (knob-body v) (if (string? v) (string-append "(lambda () \"" v "\")") (string-append "(lambda () " (number->string v) ")")))
+; the hot swap itself
+(define (adapt:set-knob! k v)
+  (mutate:rebind (knob-define k) (knob-body v) (string-append "aura-rocks adapt " k))
+  (eval-current)
+  (if (equal? (adapt:knob k) v) v (ru:fail "adapt: rebind of " k " did not take")))
+
+(define (feat fs k) (let loop ((fs fs)) (cond ((null? fs) 0.0) ((equal? (car (car fs)) k) (cdr (car fs))) (else (loop (cdr fs))))))
+; ---- measured cost: wall time per op over periods between decision points.
+; A memtable period runs from one rotation to the next, so it holds the fill
+; of one memtable under its rep plus its flush (a vector rep pays its sort
+; there). Compaction time is left out for memtable decisions (it lands in
+; whichever period happens to trigger it) and kept for compaction decisions,
+; which are judged over several periods.
+(define (db-stat db k) (let loop ((s (db:stats db))) (cond ((null? s) 0) ((equal? (car (car s)) k) (cdr (car s))) (else (loop (cdr s))))))
+(define (close-period! ctl db)
+  (let* ((now (current-time-ms)) (ops (feat (obs:features (db:obs db)) "ops")) (cms (db-stat db "compaction_ms"))
+         (p (vector (- now (vector-ref ctl 9)) (- ops (vector-ref ctl 10)) (- cms (vector-ref ctl 11)))))
+    (vector-set! ctl 8 (cons p (vector-ref ctl 8)))
+    (vector-set! ctl 9 now) (vector-set! ctl 10 ops) (vector-set! ctl 11 cms)
+    (vector-set! ctl 12 (+ (vector-ref ctl 12) 1))))
+; us/op over periods [from, from+n) counted back from the newest (0 = newest)
+(define (period-cost ctl from n with-cmp)
+  (let loop ((ps (vector-ref ctl 8)) (i 0) (ms 0) (ops 0))
+    (cond ((or (null? ps) (>= i (+ from n))) (if (> ops 0) (/ (* 1000.0 ms) ops) 0.0))
+          ((< i from) (loop (cdr ps) (+ i 1) ms ops))
+          (else (let ((p (car ps))) (loop (cdr ps) (+ i 1) (+ ms (vector-ref p 0) (if with-cmp 0 (- 0 (vector-ref p 2)))) (+ ops (vector-ref p 1))))))))
+(define (mix-dist a b)
+  (ru:max (abs (- (feat a "write_ratio") (feat b "write_ratio"))) (ru:max (abs (- (feat a "read_ratio") (feat b "read_ratio"))) (abs (- (feat a "scan_share") (feat b "scan_share"))))))
+
+; ---- rows
+(define (adapt-row! ctl knob from to decision stage speedup fs extra)
+  (let* ((rw (cond ((equal? decision "KEEP") (log (ru:max speedup 0.000001))) ((equal? decision "ROLLBACK") -1.0)
+                   ((equal? decision "ABORT") -2.0) ((equal? decision "REJECT") -0.1) (else 0.0)))
+         (row (append (list (cons "ts" (current-time-ms)) (cons "repo" "aura-rocks") (cons "knob" knob)
+                            (cons "from" (if (string? from) from (number->string from))) (cons "to" (if (string? to) to (number->string to)))
+                            (cons "decision" decision) (cons "stage" stage) (cons "speedup" (* 1.0 speedup)) (cons "reward" rw)
+                            (cons "label" (vector-ref ctl 6)) (cons "features" fs))
+                      extra)))
+    (vector-set! ctl 2 (cons row (vector-ref ctl 2)))
+    (if (vector-ref ctl 1) (rio:append! (vector-ref ctl 1) (string-append (adapt:json row) "\n") #f) #f)
+    (if (equal? (getenv "ADAPT_TRACE") "1") (begin (display (string-append "  [adapt] " knob " " (if (string? from) from (number->string from)) " -> " (if (string? to) to (number->string to)) ": " decision " (" stage ") speedup " (number->string speedup))) (newline)) #f)
+    row))
+(define (adapt:summary ctl)
+  (let loop ((rs (adapt:rows ctl)) (acc (list)))
+    (if (null? rs) (ru:rev acc)
+        (loop (cdr rs) (cons (list (cdr (assoc "knob" (car rs))) (cdr (assoc "from" (car rs))) (cdr (assoc "to" (car rs))) (cdr (assoc "decision" (car rs))) (cdr (assoc "stage" (car rs)))) acc)))))
+
+; ---- policy (rules; thresholds are the learnable part)
+(define (choose-mem ctl fs cur)
+  (cond ((and (>= (feat fs "write_ratio") (ap ctl "mem_write_hi")) (< (feat fs "scan_share") 0.02)) "vector")
+        ((>= (feat fs "scan_share") (ap ctl "mem_scan_hi")) "skiplist")
+        ((>= (feat fs "read_ratio") (ap ctl "mem_read_hi")) "hash")
+        (else cur)))
+(define (choose-cmp ctl fs cur)
+  (cond ((>= (feat fs "write_ratio") (ap ctl "cmp_write_hi")) "tiered")
+        ((>= (+ (feat fs "read_ratio") (feat fs "scan_share")) (ap ctl "cmp_read_hi")) "leveled")
+        (else cur)))
+
+; ---- memtable gate: shadow replay of the observer trace on both reps
+(define (replay-ms rep ops plen)
+  (let ((m (mem:new rep plen)) (t0 (current-time-ms)) (answers (list)))
+    (let loop ((os ops) (acc (list)))
+      (if (null? os) (cons (- (current-time-ms) t0) acc)
+          (let* ((kind (car (car os))) (k (cdr (car os))))
+            (cond ((= kind 0) (mem:put! m k entry:put "v-replayed-value-of-typical-size-0123456789-0123456789-0123456789") (loop (cdr os) acc))
+                  ((= kind 1) (mem:put! m k entry:del "") (loop (cdr os) acc))
+                  ((= kind 2) (loop (cdr os) (cons (mem:get m k) acc)))
+                  (else (let ((c (mem:cur-seek! (mem:cursor m) k)))
+                          (let scan ((n 0) (got (list)))
+                            (if (and (< n 10) (mem:cur-valid? c)) (let ((kk (mem:cur-key c))) (mem:cur-next! c) (scan (+ n 1) (cons kk got)))
+                                (loop (cdr os) (cons got acc))))))))))))
+(define (gate-mem ctl db cur cand)
+  (let* ((ops (obs:trace (db:obs db))) (plen (db:opt db "prefix_len"))
+         (a (replay-ms cur ops plen)) (b (replay-ms cand ops plen)))
+    (if (not (equal? (cdr a) (cdr b))) (list "ABORT" 0.0 (car a) (car b))
+        (let ((sp (/ (* 1.0 (ru:max (car a) 1)) (ru:max (car b) 1))))
+          (list (if (>= sp (ap ctl "mem_min_speedup")) "PASS" "REJECT") sp (car a) (car b))))))
+
+; ---- cooldown per knob
+(define (cool ctl k) (let loop ((cs (vector-ref ctl 5))) (cond ((null? cs) 0) ((equal? (car (car cs)) k) (cdr (car cs))) (else (loop (cdr cs))))))
+(define (set-cool! ctl k n) (vector-set! ctl 5 (cons (cons k n) (let loop ((cs (vector-ref ctl 5)) (acc (list))) (if (null? cs) acc (loop (cdr cs) (if (equal? (car (car cs)) k) acc (cons (car cs) acc))))))))
+
+; ---- post check of pending swaps: once `needed` periods ran under the new
+; value, compare their cost with the same number of periods before the swap
+(define (post-check! ctl db fs)
+  (let loop ((ps (vector-ref ctl 4)) (keep (list)))
+    (if (null? ps) (vector-set! ctl 4 keep)
+        (let* ((p (car ps)) (k (vector-ref p 0)) (n (vector-ref p 7)) (since (- (vector-ref ctl 12) (vector-ref p 4))))
+          (if (< since n) (loop (cdr ps) (cons p keep))
+              (let* ((cmp? (not (equal? k "memtable_rep")))
+                     (after (period-cost ctl 0 n cmp?)) (before (period-cost ctl since n cmp?))
+                     (fb (vector-ref p 5)) (extra (list (cons "cost_before_us" before) (cons "cost_after_us" after) (cons "periods" n))))
+                (cond
+                  ((or (= before 0.0) (= after 0.0) (> (mix-dist fs fb) (ap ctl "similar")))
+                   ; no baseline, or the workload moved: the comparison means nothing
+                   (adapt-row! ctl k (vector-ref p 2) (vector-ref p 3) "KEEP" "post-shifted" 1.0 fs extra)
+                   (loop (cdr ps) keep))
+                  ((> (/ after before) (ap ctl "max_regress"))
+                   (adapt:set-knob! k (vector-ref p 2))
+                   (let rs ((xs (vector-ref p 6))) (if (null? xs) #t (begin (adapt:set-knob! (car (car xs)) (cdr (car xs))) (rs (cdr xs)))))
+                   (if (and (equal? k "memtable_rep") (vector-ref ctl 7)) (db:migrate-mem! db (vector-ref p 2)) #f)
+                   (set-cool! ctl k (ap ctl "cooldown"))
+                   (adapt-row! ctl k (vector-ref p 3) (vector-ref p 2) "ROLLBACK" "post" (/ before after) fs extra)
+                   (loop (cdr ps) keep))
+                  (else
+                   (adapt-row! ctl k (vector-ref p 2) (vector-ref p 3) "KEEP" "post" (/ before after) fs extra)
+                   (loop (cdr ps) keep)))))))))
+(define (pending? ctl k) (let loop ((ps (vector-ref ctl 4))) (cond ((null? ps) #f) ((equal? (vector-ref (car ps) 0) k) #t) (else (loop (cdr ps))))))
+; restore: extra (knob . value) pairs to put back on rollback
+(define (add-pending! ctl k from to fs restore needed)
+  (vector-set! ctl 4 (cons (vector k "" from to (vector-ref ctl 12) fs restore needed) (vector-ref ctl 4))))
+
+; ---- one decision point. event: "rotate" (memtable flush) or "window" (observer window closed)
+(define (adapt:tick! ctl db event)
+  (let ((fs (obs:features (db:obs db))))
+    (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)))) #f
+        (begin
+          (close-period! ctl db)
+          (let ((t0 (current-time-ms)))
+            (post-check! ctl db fs)
+            (if (knob-on? ctl "memtable_rep") (tick-mem! ctl db fs) #f)
+            (if (and (knob-on? ctl "compaction") (equal? event "rotate")) (tick-cmp! ctl db fs) #f)
+            (let ((now (current-time-ms)))
+              (vector-set! ctl 13 (+ (vector-ref ctl 13) (- now t0)))
+              (vector-set! ctl 9 now)))
+          #t))))
+(define (tick-mem! ctl db fs)
+  (let* ((cur (adapt:knob "memtable_rep")) (cand (choose-mem ctl fs cur)))
+    (cond ((> (cool ctl "memtable_rep") 0) (set-cool! ctl "memtable_rep" (- (cool ctl "memtable_rep") 1)))
+          ((pending? ctl "memtable_rep") #f)
+          ((equal? cand cur) #f)
+          (else
+           (let* ((g (gate-mem ctl db cur cand)) (d (car g)) (extra (list (cons "replay_ms_from" (car (cdr (cdr g)))) (cons "replay_ms_to" (car (cdr (cdr (cdr g))))) (cons "threshold" (ap ctl "mem_min_speedup")))))
+             (cond ((equal? d "PASS")
+                    (adapt:set-knob! "memtable_rep" cand)
+                    (if (vector-ref ctl 7) (db:migrate-mem! db cand) #f)
+                    (adapt-row! ctl "memtable_rep" cur cand "SWAP" "gate" (car (cdr g)) fs extra)
+                    (add-pending! ctl "memtable_rep" cur cand fs (list) 1))
+                   (else
+                    (set-cool! ctl "memtable_rep" (ap ctl "cooldown"))
+                    (adapt-row! ctl "memtable_rep" cur cand d "gate" (car (cdr g)) fs extra))))))))
+; compaction knobs (lib/db.aura reads them at every flush): no shadow gate
+; (a compaction cannot be replayed cheaply), the post check decides
+(define (tick-cmp! ctl db fs)
+  (let* ((cur (adapt:knob "compaction_style")) (cand (choose-cmp ctl fs cur)))
+    (cond ((> (cool ctl "compaction_style") 0) (set-cool! ctl "compaction_style" (- (cool ctl "compaction_style") 1)))
+          ((pending? ctl "compaction_style") #f)
+          ((equal? cand cur) #f)
+          (else
+           (let ((trig (if (equal? cand "tiered") (ap ctl "l0_trigger_write") (ap ctl "l0_trigger_read")))
+                 (old-trig (adapt:knob "l0_trigger")))
+             (adapt:set-knob! "compaction_style" cand)
+             (adapt:set-knob! "l0_trigger" trig)
+             (adapt:set-knob! "max_runs" (ap ctl "max_runs"))
+             (adapt-row! ctl "compaction_style" cur cand "SWAP" "policy" 1.0 fs (list (cons "l0_trigger_from" old-trig) (cons "l0_trigger_to" trig)))
+             ; leaving tiered: collapse the sorted runs once (read amp back to 1 run)
+             (if (equal? cand "leveled") (db:compact! db) #f)
+             (add-pending! ctl "compaction_style" cur cand fs (list (cons "l0_trigger" old-trig)) (ap ctl "cmp_periods")))))))
+
+; install the controller as the db hook
+(define (adapt:attach! ctl db label)
+  (vector-set! ctl 6 label)
+  (db:set-hook! db (lambda (d event) (adapt:tick! ctl d event))))

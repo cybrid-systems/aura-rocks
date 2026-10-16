@@ -6,7 +6,8 @@
 ; references to workspace defines are not in workspace definition order can
 ; call a DIFFERENT define. Here they appear exactly in ws/hot.aura order, and
 ; tests/test_leaf.aura rebinds each leaf and checks every leaf:* follows it.
-(export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek)
+(export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek
+        leaf:memtable-rep leaf:compaction-style leaf:l0-trigger leaf:max-runs)
 (require "hot" all:)
 
 (define (leaf:checksum s start end) (rk-checksum s start end))
@@ -14,3 +15,8 @@
 (define (leaf:bloom-probe bits nbits h k) (rk-bloom-probe bits nbits h k))
 (define (leaf:dec s off w) (rk-dec s off w))
 (define (leaf:block-seek blk key n ra) (rk-block-seek blk key n ra))
+; adaptive policy defines (after the leaves, in ws/hot.aura order)
+(define (leaf:memtable-rep) (rk-memtable-rep))
+(define (leaf:compaction-style) (rk-compaction-style))
+(define (leaf:l0-trigger) (rk-l0-trigger))
+(define (leaf:max-runs) (rk-max-runs))

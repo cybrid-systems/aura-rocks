@@ -9,9 +9,20 @@ cd "$REPO_ROOT"
 status=0
 files=("$@")
 [ ${#files[@]} -eq 0 ] && files=("$REPO_ROOT"/tests/*.aura)
+# tests that take a memtable rep run once per rep (ROCKS_TEST_REP)
+runs=()
 for t in "${files[@]}"; do
+  if grep -q 'ROCKS_TEST_REP' "$t"; then
+    for r in ${ROCKS_TEST_REPS:-skiplist vector hash}; do runs+=("$t@$r"); done
+  else
+    runs+=("$t@")
+  fi
+done
+for run in "${runs[@]}"; do
+  t="${run%@*}"; rep="${run##*@}"
   s=$(date +%s)
-  out=$("$AURA_BIN" "$t" 2>&1); rc=$?
+  out=$(ROCKS_TEST_REP="$rep" "$AURA_BIN" "$t" 2>&1); rc=$?
+  [ -n "$rep" ] && t="$t[$rep]"
   pass=$(grep -c '^PASS' <<<"$out" || true)
   once=$(grep -c '^RUN-ONCE' <<<"$out" || true)
   secs=$(( $(date +%s) - s ))
