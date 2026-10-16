@@ -76,12 +76,14 @@
               (ru:fail "cannot read ADAPT_PROPOSAL " p)))
         (adapt-defaults))))
 
-; ctl = #(params traj-path rows knobs pending cooldowns label live periods last-ms last-ops last-cmp-ms nperiods)
+; ctl = #(params traj-path rows knobs pending cooldowns label live rot-tracker - - - - overhead win-tracker)
 ; knobs: list of enabled knobs ("memtable_rep", "compaction")
-; pending: list of #(knob "" from to period-at-swap feats restore needed-periods)
-; periods: newest first, #(wall-ms ops compaction-ms) between two decision points
+; pending: list of #(knob "" from to period-at-swap feats restore needed-periods tracker-slot)
+; trackers (slot 8: memtable rotations, slot 14: observer windows):
+;   #(periods last-ms last-ops last-cmp-ms count), periods newest first #(wall-ms ops compaction-ms)
+(define (tracker-new) (vector (list) (current-time-ms) 0 0 0))
 (define (adapt:new traj-path knobs live)
-  (vector (adapt-load-proposal) traj-path (list) knobs (list) (list) "" live (list) (current-time-ms) 0 0 0 0))
+  (vector (adapt-load-proposal) traj-path (list) knobs (list) (list) "" live (tracker-new) 0 0 0 0 0 (tracker-new)))
 ; ms the controller itself spent (gate replays, rebinds, live migrations); kept
 ; out of the measured periods, but it is part of the db's wall time
 (define (adapt:overhead-ms ctl) (vector-ref ctl 13))
@@ -114,18 +116,22 @@
 ; whichever period happens to trigger it) and kept for compaction decisions,
 ; which are judged over several periods.
 (define (db-stat db k) (let loop ((s (db:stats db))) (cond ((null? s) 0) ((equal? (car (car s)) k) (cdr (car s))) (else (loop (cdr s))))))
-(define (close-period! ctl db)
+(define (close-period! tr db)
   (let* ((now (current-time-ms)) (ops (feat (obs:features (db:obs db)) "ops")) (cms (db-stat db "compaction_ms"))
-         (p (vector (- now (vector-ref ctl 9)) (- ops (vector-ref ctl 10)) (- cms (vector-ref ctl 11)))))
-    (vector-set! ctl 8 (cons p (vector-ref ctl 8)))
-    (vector-set! ctl 9 now) (vector-set! ctl 10 ops) (vector-set! ctl 11 cms)
-    (vector-set! ctl 12 (+ (vector-ref ctl 12) 1))))
+         (p (vector (- now (vector-ref tr 1)) (- ops (vector-ref tr 2)) (- cms (vector-ref tr 3)))))
+    (vector-set! tr 0 (cons p (vector-ref tr 0)))
+    (vector-set! tr 1 now) (vector-set! tr 2 ops) (vector-set! tr 3 cms)
+    (vector-set! tr 4 (+ (vector-ref tr 4) 1))))
 ; us/op over periods [from, from+n) counted back from the newest (0 = newest)
-(define (period-cost ctl from n with-cmp)
-  (let loop ((ps (vector-ref ctl 8)) (i 0) (ms 0) (ops 0))
+(define (period-cost tr from n with-cmp)
+  (let loop ((ps (vector-ref tr 0)) (i 0) (ms 0) (ops 0))
     (cond ((or (null? ps) (>= i (+ from n))) (if (> ops 0) (/ (* 1000.0 ms) ops) 0.0))
           ((< i from) (loop (cdr ps) (+ i 1) ms ops))
           (else (let ((p (car ps))) (loop (cdr ps) (+ i 1) (+ ms (vector-ref p 0) (if with-cmp 0 (- 0 (vector-ref p 2)))) (+ ops (vector-ref p 1))))))))
+; memtable decisions are judged over rotation periods (fill + flush of one
+; memtable), compaction decisions over observer windows
+(define (knob-tracker-slot k) (if (equal? k "memtable_rep") 8 14))
+; how far the op mix moved between two feature sets (max abs difference of shares)
 (define (mix-dist a b)
   (ru:max (abs (- (feat a "write_ratio") (feat b "write_ratio"))) (ru:max (abs (- (feat a "read_ratio") (feat b "read_ratio"))) (abs (- (feat a "scan_share") (feat b "scan_share"))))))
 
@@ -187,10 +193,10 @@
 (define (post-check! ctl db fs)
   (let loop ((ps (vector-ref ctl 4)) (keep (list)))
     (if (null? ps) (vector-set! ctl 4 keep)
-        (let* ((p (car ps)) (k (vector-ref p 0)) (n (vector-ref p 7)) (since (- (vector-ref ctl 12) (vector-ref p 4))))
+        (let* ((p (car ps)) (k (vector-ref p 0)) (n (vector-ref p 7)) (tr (vector-ref ctl (vector-ref p 8))) (since (- (vector-ref tr 4) (vector-ref p 4))))
           (if (< since n) (loop (cdr ps) (cons p keep))
               (let* ((cmp? (not (equal? k "memtable_rep")))
-                     (after (period-cost ctl 0 n cmp?)) (before (period-cost ctl since n cmp?))
+                     (after (period-cost tr 0 n cmp?)) (before (period-cost tr since n cmp?))
                      (fb (vector-ref p 5)) (extra (list (cons "cost_before_us" before) (cons "cost_after_us" after) (cons "periods" n))))
                 (cond
                   ((or (= before 0.0) (= after 0.0) (> (mix-dist fs fb) (ap ctl "similar")))
@@ -210,7 +216,8 @@
 (define (pending? ctl k) (let loop ((ps (vector-ref ctl 4))) (cond ((null? ps) #f) ((equal? (vector-ref (car ps) 0) k) #t) (else (loop (cdr ps))))))
 ; restore: extra (knob . value) pairs to put back on rollback
 (define (add-pending! ctl k from to fs restore needed)
-  (vector-set! ctl 4 (cons (vector k "" from to (vector-ref ctl 12) fs restore needed) (vector-ref ctl 4))))
+  (let ((slot (knob-tracker-slot k)))
+    (vector-set! ctl 4 (cons (vector k "" from to (vector-ref (vector-ref ctl slot) 4) fs restore needed slot) (vector-ref ctl 4)))))
 
 ; ---- one decision point. event: "rotate" (memtable flush) or "window" (observer window closed)
 (define (adapt:tick! ctl db event)
@@ -218,14 +225,16 @@
     ; window events: live memtable switching, and compaction (a read phase has no flushes)
     (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)) (not (knob-on? ctl "compaction")))) #f
         (begin
-          (close-period! ctl db)
+          (close-period! (vector-ref ctl (if (equal? event "rotate") 8 14)) db)
           (let ((t0 (current-time-ms)))
             (post-check! ctl db fs)
             (if (and (knob-on? ctl "memtable_rep") (or (equal? event "rotate") (vector-ref ctl 7))) (tick-mem! ctl db fs) #f)
             (if (knob-on? ctl "compaction") (tick-cmp! ctl db fs) #f)
             (let ((now (current-time-ms)))
               (vector-set! ctl 13 (+ (vector-ref ctl 13) (- now t0)))
-              (vector-set! ctl 9 now)))
+              ; the tick's own time is moved out of both open periods
+              (vector-set! (vector-ref ctl 8) 1 (+ (vector-ref (vector-ref ctl 8) 1) (- now t0)))
+              (vector-set! (vector-ref ctl 14) 1 (+ (vector-ref (vector-ref ctl 14) 1) (- now t0)))))
           #t))))
 (define (tick-mem! ctl db fs)
   (let* ((cur (adapt:knob "memtable_rep")) (cand (choose-mem ctl fs cur)))
