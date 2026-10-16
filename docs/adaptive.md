@@ -181,6 +181,72 @@ What changed:
   - Adaptive also still loses B and D: the collapse before B, and leveled during D until the EMA catches up.
 - **In the cache bench the right answer is now "no cache".** With block checksums in C, every policy costs more than it saves. The controller cannot pick "none": it only switches among lru, lfu and clock.
 
+## Native data plane + Aura control plane (2026-10-16, after 7c075da)
+
+Since c7b4f45 / 7c075da the structures live in C (`native/rk_native.c`: the skiplist / vector / hash memtable reps, leveled / tiered compaction, the LRU / LFU / CLOCK cache), and Aura (`lib/nctl.aura`) only steers them. Each decision still follows features → rule → gate → swap → post check → row, and rows keep the `lib/adapt.aura` trajectory format plus `"engine":"native"`. What moved where:
+
+| step | Aura engine (`lib/adapt.aura`) | native data plane, `nctl` v0 (`native=0`) | native data plane, `nctl` (`native=1`, default) |
+|---|---|---|---|
+| counters | Aura observer on every op (`obs:put!` / `obs:get!`, ~2 ms/op) | native atomics | native atomics + op / block-access sampling rings (`sample_pct` 5%) |
+| features | Aura EMA per window | stats string parsed in Aura, every window | one `rkn_sample_v` call per window: features, EWMA and a change score computed in C, fixed-width decode |
+| rules | every window | every window | **two tiers**: change score < `change_hi` (0.15) → no decision work at all; else the rules |
+| memtable gate | Soft replay of 256 ops on Aura memtables | none | replay simulation of the sampled ops in a **native background thread** (`rkn_sim_start` / `rkn_sim_poll`) |
+| cache gate | rk-cache-sim kernel | none | SHARDS-style cache simulation, native background thread |
+| swap | `mutate:rebind` of a workspace define | `ndb:set!`, applied at the next rotation | same |
+| post check | wall time, 1–4 windows | native ns/op (foreground time; compaction excluded except for `compaction_style`), mean over `periods` 3 windows | same |
+
+### Controller cost and reaction lag, before / after
+
+The phase bench (`scripts/bench_adapt_native.aura`, `BENCH_SCALE=10`: A 12,000 sequential puts → B 5,000 ops 90% gets → C 1,500 ops 70% scans of 10 → D 6,000 random puts; 24,500 ops; 16 KB memtable, window 500 ops). Medians of 3 runs, one process per run, box shared with other workers' Aura builds (load ~4). Raw rows: `adaptive/bench_adapt_native-tick50.jsonl` and `-tick1.jsonl`.
+
+| | Aura engine + `lib/adapt.aura`, pure | same, with sink | native, `nctl` v0 | native, `nctl` |
+|---|---:|---:|---:|---:|
+| controller time per run | 24,584 ms (2,450 ops) | 11,409 ms (2,450 ops) | 10,542 ms (24,500 ops) | **1,752 ms** (24,500 ops) |
+| per op of workload | 10.0 ms | 4.66 ms | 430 µs | **72 µs** |
+| per window | ~1,000 ms (window 100) | ~465 ms (window 100) | 215 ms (window 500) | **36 ms** (window 500) |
+| one sample / feature step | — | — | ~194 ms (`nctl:sample!`) | **~8.5 ms** |
+| windows with no decision work | 0 | 0 | 0 of 49 | 27 of 49 (tier 1) |
+| reaction lag, ops from phase start to first switch (A / B / C / D) | not measured | not measured | 1,500 / 500 / 500 / 500 | 1,500 / 1,000 / 1,000 / 1,000 |
+
+- **Controller cost: 6.0× cheaper than `nctl` v0 on the same data plane, and ~65× cheaper per op than the sink-era Aura controller** (the old bench had a 10× smaller workload, so compare per op or per window, not per run).
+- **Reaction lag got worse by one window (500 ops) in B, C and D.** The change detector needs the EWMA to move past `change_hi` before tier 2 runs, while v0 evaluated the rules on every window. A lower `change_hi` or a smaller window buys back the lag at more controller time; the trade-off is a proposal parameter for aura-loop, not tuned here. Phase A's 1,500 ops is the `warmup` (2 windows) in both.
+- **What it still costs.** 72 µs per op of controller time is more than the data plane's own time per op (20–45 µs). Most of it is Aura work per evaluated window: decoding the sample, the rules, the post-check bookkeeping, writing the trajectory row.
+- **Ticking.** With `nctl:tick!` called after every op (`BENCH_TICK=1`), the adaptive run's wall time was 1,416 µs/op against 1,170 with `nctl:tick-n!` once per 50 ops (`BENCH_TICK=50`, the default now). Static configs (no ticks) were the same in both runs, so a per-op tick from Aura costs about 250 µs/op on this build. Applications should tick per batch.
+
+### Adaptive vs best static
+
+Native µs/op is the data plane's own time (`write_ns + read_ns + scan_ns` deltas). Wall µs/op includes the Aura harness (loop, key build, `ndb` calls) and the controller. Bold = best static per column.
+
+`BENCH_TICK=50`, native µs/op:
+
+| config | A write seq | B read random | C scan | D write random | total |
+|---|---:|---:|---:|---:|---:|
+| skiplist:leveled | 28.2 | 13.3 | **27.5** | 64.0 | 35.4 |
+| vector:tiered | **21.6** | 7.8 | 64.2 | 60.5 | 34.2 |
+| hash:leveled | 33.0 | 10.9 | 34.3 | 69.7 | 34.7 |
+| skiplist:tiered | 36.0 | 9.6 | 42.8 | **27.6** | 33.2 |
+| vector:leveled | 32.4 | 11.8 | 27.8 | 42.5 | **31.6** |
+| hash:tiered | 34.9 | **7.6** | 47.6 | 29.1 | 38.4 |
+| adaptive | 18.4 | 10.1 | 31.1 | 26.9 | 20.4 |
+| adaptive (v0) | 27.3 | 10.0 | 29.2 | 22.8 | 22.8 |
+
+`BENCH_TICK=50`, wall µs/op:
+
+| config | A | B | C | D | total |
+|---|---:|---:|---:|---:|---:|
+| best static per column | 461.9 (vector:tiered) | 754.8 (hash:tiered) | 7,989 (skiplist:leveled) | 629.8 (skiplist:tiered) | **1,126.9** (skiplist:leveled) |
+| adaptive | 522.1 | 880.0 | 8,048 | 729.5 | 1,169.5 |
+| adaptive (v0) | 908.2 | 1,267.2 | 8,415 | 1,060.5 | 1,534.7 |
+
+Read honestly:
+
+- **Data-plane time: in this run adaptive (20.4) beat the best static config (vector:leveled 31.6) by 1.5×,** and won A and D outright. It switches memtable rep and compaction style per phase (vector for sequential writes, tiered for random writes, back to leveled + skiplist / hash for reads and scans), which no single static config can do.
+- **But the static numbers are noisy and the earlier run disagrees.** Per-run totals of one static config spread 2–4× (skiplist:tiered 20.9–37.7, vector:tiered 25.5–96.0): the box ran other workers' compiles throughout. The best single static run (skiplist:tiered, 20.9) ties adaptive's median. In the earlier `BENCH_TICK=1` run of the same bench, adaptive was 43.1 against a best static median of 34.9 (skiplist:leveled), i.e. it **lost** 1.24×. Two batches, opposite answers: the data-plane result is **not conclusive** and needs a quiet box and more reps.
+- **Wall time: adaptive still loses to the best static, by 1.04× (1,169.5 vs 1,126.9).** It is within the spread of the static configs (1,127–1,174), because ~95% of each op's wall time is the Aura harness, which is the same for every config. The controller's 72 µs/op is larger than the data-plane time it can save (~10 µs/op even in the favourable run).
+- **Compared with the Aura engine:** the sink-era result was adaptive 20.7 ms/op vs best static 13.6 ms/op (1.52× worse). On the native data plane the gap is 1.04× in wall time, and every native config is ~12× faster per op from Aura.
+- Every run ended with 0 wrong values (`final check`); every switch went through the gate and post check (example adaptive run: 18 rows: 9 SWAP, 7 KEEP, 2 ROLLBACK).
+
+
 ## Gaps
 
 - **Policy quality.** The rule thresholds are hand defaults. Two benchmark runs give aura-loop too few realized transitions to move them, so a real loop needs many more labelled runs, and phase-shift detection that beats the EMA and cooldown lag.

@@ -2,6 +2,50 @@
 
 Same box, same session, same workloads and options. Each engine ran alone, one run at a time, with nothing else benchmarking. Every number below was measured. Cells show the **median µs/op** with the rep count in parentheses. Raw rows are in [vs-rocksdb/](vs-rocksdb/).
 
+## Native data plane (2026-10-16, after c7b4f45)
+
+Since c7b4f45 the data plane is native: memtable, WAL, SST, flush, compaction and cache live in C (`native/rk_native.c`) behind a handle, and Aura is only the control plane (`lib/nctl.aura`). Same box, same db_bench options as below, RocksDB re-run in the same session. Aura 89cbd6c2b, Soft face. Cells show the **median µs/op** of 3 reps (RocksDB 3 reps). Raw rows: `vs-rocksdb/native-n2000.jsonl`, `native-n20000.jsonl`, `rocksdb-native-session.jsonl`.
+
+Three ways to drive the native engine (`scripts/vs_native.sh N 3 OUT "engine op batch"`, `scripts/bench_native.aura`):
+
+- **engine**: the native workload driver (`rkn_bench`): keys, values and the loop are in C, with no Aura per op. This is what db_bench measures for RocksDB, so it is the like-for-like comparison of the two engines.
+- **op**: an Aura program, one native call per op. The key is built in Aura, then `ndb:put!` / `ndb:get`; readseq = `ndb:scan`, 256 entries per call.
+- **batch**: an Aura program, one native call per 100 ops (`ndb:write!` / `ndb:multi-get`).
+
+### N=2000
+
+| workload | RocksDB 9.10 | native engine | engine / RocksDB | Aura op | op / RocksDB | Aura batch | earlier sink (Aura engine + 12 kernels) | op vs sink |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fillseq | 3.92 | 3.58 | 0.91× | 117.5 | 30× | 218 | 12,752 | 109× faster |
+| fillrandom | 4.50 | 7.10 | 1.58× | 126.0 | 28× | 243 | 12,718 | 101× faster |
+| readrandom | 2.57 | 1.00 | 0.39× | 167.5 | 65× | 369 | 11,656 | 70× faster |
+| readseq (per entry) | 0.269 | 0.045 | 0.17× | 297 | 1,104× | 310 | 1,926 | 6.5× faster |
+| readmissing | 0.479 | 0.157 | 0.33× | 176.5 | 368× | 365 | 10,124 | 57× faster |
+
+### N=20000
+
+| workload | RocksDB 9.10 | native engine | engine / RocksDB | Aura op | op / RocksDB | Aura batch | earlier sink (1 rep) | op vs sink |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fillseq | 3.74 | 2.86 | 0.77× | 253.6 | 68× | 448 | 15,410 | 61× faster |
+| fillrandom | 4.77 | 6.06 | 1.27× | 283.7 | 59× | 490 | 23,434 | 83× faster |
+| readrandom | 3.26 | 1.17 | 0.36× | 248.6 | 76× | 936 | 17,429 | 70× faster |
+| readseq (per entry) | 0.328 | 0.049 | 0.15× | 292.8 | 893× | 298 | 16,656 | 57× faster |
+| readmissing | 0.422 | 0.191 | 0.45× | 605.1 | 1,434× | 1,669 | 17,663 | 29× faster |
+
+Spread (min–max over the reps) is in the raw rows. The widest: engine fillrandom 3.97–11.0 at N=2000 (one slow first rep), RocksDB readseq 0.24–0.64.
+
+What this shows:
+
+- **Engine against engine, the native data plane is in RocksDB's range.** Fills are 0.8–1.6× RocksDB's time (fillrandom is slower: 2 levels, so each L0 compaction rewrites all of L1). Reads come out 2–7× faster than RocksDB. The read path is built the same way (no block cache on either side; index and filter held per table; each get `pread`s a 4 KB block through the OS page cache and verifies its checksum), but the comparison still flatters aura-rocks: Debian's db_bench runs with assertions on, and aura-rocks is a much smaller engine (2 levels; no snapshots, column families, pluggable comparators, compression, or iterator pinning). The fair reading is "same order of magnitude", not "faster than RocksDB".
+- **Driven from Aura, an op costs 120–600 µs, and almost none of that is the engine.** The engine's share is the engine column (≤ 7 µs). The rest is the Aura side: the interpreter loop, building the key string, the `ndb` wrapper, and the c-func call (about 1–2 µs). The per-op cost also doubles from N=2000 to N=20000 at the same engine time, so it grows with the Aura process heap, not with the DB.
+- **Batching does not help from Aura, it hurts (1.8–2.8×).** One native call per 100 ops saves 99 calls, but the batch has to be built and decoded in Aura (a list of `("put" k v)` entries encoded into one String, and the multi-get answer sliced back into a list). That costs more than the calls it saves.
+- **readseq per entry stays flat at ~295 µs from N=2000 to N=20000** (the earlier sink path got 9× worse: quadratic `substring`, aura#4548). The scan chunk is decoded in Aura, one entry at a time.
+- **Against the earlier Aura engine with kernels, the native data plane is 29–109× faster per op from the same Aura harness**, and 2,600–20,000× faster engine against engine.
+
+So the remaining gap to RocksDB for an Aura application is the Aura per-op cost of calling in, not the storage engine. It is the same boundary cost aura-redis pays and amortizes over a network request. Closing it needs a cheaper interpreter loop and c-func call path and Strings that can be passed without copying (tracked by another worker; see the Aura issues list), or keeping whole loops native, as the engine driver does.
+
+The sections below are the earlier measurements of the pure-Aura and sink engines (f0d5b78) and are unchanged.
+
 ## Setup
 
 - **Box:** 8 cores (Intel Xeon), Debian 13, ext4. Aura 89cbd6c2b (RelWithDebInfo), Soft face.

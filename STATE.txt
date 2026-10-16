@@ -19,3 +19,7 @@ adaptive_result=with sink 2026-10-16: adaptive 20.7 ms/op beats every pre-sink c
 gaps=block cache process-wide and block-counted; controller gates in Soft are expensive; no compaction shadow gate; no snapshots/iterators over live writes; two levels; ASCII keys/values; memtable / bloom check / obs still Soft; memtable replay gate Soft; pure Soft mode 10-40% slower than b3d934c; single-threaded
 bench_2026_10_16=docs/bench-2026-10-16 (before b3d934c vs after ff22974 soft/sink/kept)
 aura_issues_new=4550,4551,4552,4553
+data_plane=native    # since c7b4f45: native/rk_native.c (memtable reps, WAL, SST, flush, compaction, cache) behind a handle; lib/ndb.aura binding; lib/db.aura = reference oracle
+control_plane=nctl   # lib/nctl.aura: one rkn_sample_v per window (native features/EWMA/change score), two tiers, background native sims, post check; nctl:tick-n! per batch
+native_result=2026-10-16 N=20000 us/op RocksDB 9.10 / native engine / from Aura per op: fillseq 3.74/2.86/254 fillrandom 4.77/6.06/284 readrandom 3.26/1.17/249 readseq 0.33/0.05/293 readmissing 0.42/0.19/605; docs/vs-rocksdb.md
+nctl_result=2026-10-16 ctl 1752 ms/run (72 us/op, 36 ms/window) vs v0 10542; lag 1000-1500 ops vs v0 500; adaptive vs best static: native us/op 20.4 vs 31.6 (tick50) but 43.1 vs 34.9 (tick1) -> not conclusive; wall 1169.5 vs 1126.9 (1.04x); docs/adaptive.md

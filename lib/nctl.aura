@@ -46,7 +46,7 @@
 ; stalled by it; nctl:swap-impl! runs it to completion at once.
 ; Every decision is one JSON line (lib/adapt.aura trajectory format, plus
 ; "engine":"native"), for aura-loop (aura_loop/adapt_ingest.py).
-(export nctl:new nctl:tick! nctl:sample! nctl:rows nctl:summary nctl:swap-impl! nctl:propose-impl! nctl:gate-running?
+(export nctl:new nctl:tick! nctl:tick-n! nctl:sample! nctl:rows nctl:summary nctl:swap-impl! nctl:propose-impl! nctl:gate-running?
         nctl:gate nctl:params nctl:set-param! nctl:features nctl:overhead-ms nctl:windows nctl:skipped)
 (require "ru" all:)
 (require "rio" all:)
@@ -268,6 +268,12 @@
 (define (nctl:tick! ctl)
   (vector-set! ctl 4 (+ (vector-ref ctl 4) 1))
   (vector-set! ctl 15 (+ (vector-ref ctl 15) 1))
+  (if (>= (vector-ref ctl 4) (vector-ref ctl 19)) (nctl:sample! ctl) #f))
+; the same for n ops at once: an application that ticks every k ops (e.g. per
+; batch) pays the interpreter cost of a tick once per k ops instead of per op
+(define (nctl:tick-n! ctl n)
+  (vector-set! ctl 4 (+ (vector-ref ctl 4) n))
+  (vector-set! ctl 15 (+ (vector-ref ctl 15) n))
   (if (>= (vector-ref ctl 4) (vector-ref ctl 19)) (nctl:sample! ctl) #f))
 (define (nctl:skipped ctl) (vector-ref ctl 17))
 (define (nctl:summary ctl)
