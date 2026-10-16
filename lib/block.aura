@@ -1,0 +1,27 @@
+; lib/block.aura — SST data block.
+;
+;   block = entries  restart(6 x n)  n(6)
+; restart[i] = offset of entry i (every entry is a restart point: no key
+; prefix compression in the MVP). Lookup is the hot leaf rk-block-seek
+; (lower bound, byte-wise compare). On disk a block is followed by its
+; Adler-32 (10 digits), verified on every read.
+(export blk:build blk:count blk:ra blk:off blk:seek blk:key blk:type blk:val)
+(require "leaf" all:)
+(require "ru" all:)
+(require "entry" all:)
+
+; encoded: list of entry strings in key order -> block string
+(define (blk:build encoded)
+  (let loop ((es encoded) (off 0) (n 0) (offs (list)))
+    (if (null? es)
+        (ru:concat (append encoded (ru:rev offs) (list (ru:pad n 6))))
+        (loop (cdr es) (+ off (string-length (car es))) (+ n 1) (cons (ru:pad off 6) offs)))))
+
+(define (blk:count b) (leaf:dec b (- (string-length b) 6) 6))
+(define (blk:ra b n) (- (string-length b) 6 (* 6 n)))
+(define (blk:off b ra i) (leaf:dec b (+ ra (* 6 i)) 6))
+; lower bound index in [0, n]
+(define (blk:seek b key n ra) (leaf:block-seek b key n ra))
+(define (blk:key b off) (entry:key-at b off))
+(define (blk:type b off) (entry:type-at b off))
+(define (blk:val b off) (entry:val-at b off))

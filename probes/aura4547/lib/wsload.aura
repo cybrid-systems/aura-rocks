@@ -1,0 +1,4 @@
+(export wsload:ok)
+(define wsload:ok #t)
+(set-code "(define wa (lambda (x) (+ x 1000)))\n(define wb (lambda (x) (+ x 2000)))\n")
+(eval-current)

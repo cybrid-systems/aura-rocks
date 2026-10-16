@@ -1,0 +1,36 @@
+; lib/wal.aura — write-ahead log.
+;
+;   record = "R" len(8) cksum(10) payload      payload = entry (lib/entry.aura)
+;   cksum  = (leaf:checksum payload 0 len)        Adler-32, a hot leaf
+; Appended with rio:append! (O_APPEND through kernels/rocks_io.c). Replay
+; stops at the first short, malformed or checksum-mismatched record: a torn
+; tail from a crash is dropped, everything before it is applied in order.
+(export wal:record wal:append! wal:replay)
+(require "leaf" all:)
+(require "ru" all:)
+(require "rio" all:)
+(require "entry" all:)
+
+(define (wal:record type key val)
+  (let ((p (entry:encode type key val)))
+    (string-append "R" (ru:pad (string-length p) 8) (ru:pad (leaf:checksum p 0 (string-length p)) 10) p)))
+
+(define (wal:append! path type key val sync)
+  (rio:append! path (wal:record type key val) sync))
+
+; (apply! type key val) per good record. Returns (records good-bytes total-bytes).
+(define (wal-digits? s off w)
+  (let loop ((i 0)) (cond ((>= i w) #t) ((let ((c (string-ref s (+ off i)))) (and (>= c 48) (<= c 57))) (loop (+ i 1))) (else #f))))
+(define (wal:replay path apply!)
+  (let ((s (rio:read path)))
+    (if (not s) (list 0 0 0)
+        (let ((n (string-length s)))
+          (let loop ((off 0) (count 0))
+            (if (or (> (+ off 19) n) (not (= (string-ref s off) 82)) (not (wal-digits? s (+ off 1) 18)))
+                (list count off n)
+                (let* ((len (leaf:dec s (+ off 1) 8)) (ck (leaf:dec s (+ off 9) 10)) (p (+ off 19)))
+                  (if (or (> (+ p len) n) (< len 11) (not (= ck (leaf:checksum s p (+ p len)))))
+                      (list count off n)
+                      (begin
+                        (apply! (entry:type-at s p) (entry:key-at s p) (entry:val-at s p))
+                        (loop (+ p len) (+ count 1)))))))))))

@@ -1,0 +1,21 @@
+; scripts/sink.aura — run the sink policy over every hot leaf (ws/hot.aura)
+; and append KEEP/ROLLBACK/ABORT/SKIP rows to $SINK_TRAJECTORY
+; (default build/trajectory.jsonl). Knobs: SINK_ONLY=<name>,
+; SINK_MIN_SOFT_US (floor, default 50), SINK_MIN_SPEEDUP (else the workspace
+; (sink-min-speedup) = 1.5), SINK_SCORE_ROUNDS (best of N, default 3).
+(require "hot" all:)
+(require "rsink" all:)
+(require "plant" all:)
+(require "score" all:)
+(hot:load!)   ; top-level statement: see lib/hot.aura (aura#4546, aura#4547)
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(score:set-rounds! (string->number (env-or "SINK_SCORE_ROUNDS" "3")))
+(define plant (plant:real))
+(define samples (rsink:samples))
+(define only (let ((o (env-or "SINK_ONLY" ""))) (if (equal? o "") #f o)))
+(define thr (let ((v (env-or "SINK_MIN_SPEEDUP" ""))) (if (equal? v "") #f (string->number v))))
+(define rows #f)
+(set! rows (rsink:sink-all! plant samples only (string->number (env-or "SINK_MIN_SOFT_US" "50")) thr (env-or "SINK_TRAJECTORY" "build/trajectory.jsonl")))
+(define s (rsink:summary))
+(display "sink: KEEP ") (display (car s)) (display " ROLLBACK ") (display (car (cdr s)))
+(display " ABORT ") (display (car (cdr (cdr s)))) (display " SKIP ") (display (car (cdr (cdr (cdr s))))) (newline)

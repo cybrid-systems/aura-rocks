@@ -1,0 +1,60 @@
+; lib/rio.aura — file I/O for the engine.
+;
+; Aura has whole-file read-file / write-file (O_TRUNC) only. Appends,
+; rename and unlink go through kernels/rocks_io.c (std/ffi c-func) when
+; build/kernels/librocks_io.so exists; otherwise a pure-Aura fallback:
+; append = read + rewrite (O(file), not crash-atomic), rename = copy +
+; delete. (rio:mode) says which one is active.
+(export rio:init! rio:mode rio:read rio:write rio:append! rio:rename! rio:unlink! rio:exists? rio:mkdir! rio:list)
+
+(require "std/ffi" all:)
+(require "std/io" all:)
+(require "std/process" all:)
+(require "ru" all:)
+
+(define rio-lib #f)
+(define rio-fn-append #f)
+(define rio-fn-rename #f)
+(define rio-fn-unlink #f)
+
+; Load the helper once (each c-func call allocates an FFI id).
+(define (rio:init!)
+  (if rio-lib #t
+      (let ((so (string-append (ru:root) "/build/kernels/librocks_io.so")))
+        (if (equal? (getenv "ROCKS_PURE_IO") "1") #f
+            (let ((lib (try (c-load so) (catch (e) #f))))
+              (if (and lib (not (equal? lib -1)))
+                  (begin
+                    (set! rio-lib lib)
+                    (set! rio-fn-append (c-func lib "rocks_append" "(String String Int Int) -> Int"))
+                    (set! rio-fn-rename (c-func lib "rocks_rename" "(String String) -> Int"))
+                    (set! rio-fn-unlink (c-func lib "rocks_unlink" "(String) -> Int"))
+                    #t)
+                  #f))))))
+
+(define (rio:mode) (if rio-lib "ffi" "pure"))
+
+(define (rio:read path) (let ((s (read-file path))) (if (string? s) s #f)))
+(define (rio:write path s) (write-file path s) #t)
+
+(define (rio:append! path s sync)
+  (if rio-lib
+      (let ((r (rio-fn-append path s (string-length s) (if sync 1 0))))
+        (if (< r 0) (ru:fail "append " path " failed, errno " (number->string (- r))) r))
+      (let ((old (rio:read path)))
+        (write-file path (if old (string-append old s) s))
+        (string-length s))))
+
+(define (rio:rename! from to)
+  (if rio-lib
+      (let ((r (rio-fn-rename from to)))
+        (if (< r 0) (ru:fail "rename " from " -> " to " failed, errno " (number->string (- r))) #t))
+      (begin (write-file to (rio:read from)) (file-delete from) #t)))
+
+(define (rio:unlink! path)
+  (if rio-lib (rio-fn-unlink path) (try (file-delete path) (catch (e) #f)))
+  #t)
+
+(define (rio:exists? path) (string? (read-file path)))
+(define (rio:mkdir! dir) (shell (string-append "mkdir -p '" dir "'")) #t)
+(define (rio:list dir) (try (directory-list dir) (catch (e) (list))))

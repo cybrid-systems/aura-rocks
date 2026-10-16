@@ -1,0 +1,7 @@
+(require "wsload" all:)   ; module whose top level runs set-code + eval-current (defines wa, wb)
+(require "caller6" all:)  ; module: (define (caller6:b) (wb 1)) then (define (caller6:a) (wa 1))
+(display (list "before: wb" (wb 1) "caller6:b" (caller6:b) "caller6:a" (caller6:a))) (newline)
+(mutate:rebind "wb" "(lambda (x) (+ x 3000))" "repro")
+(display (list "after rebind: wb" (wb 1) "caller6:b" (caller6:b) "caller6:a" (caller6:a))) (newline)
+(eval-current)
+(display (list "after eval-current: wb" (wb 1) "caller6:b" (caller6:b) "caller6:a" (caller6:a))) (newline)

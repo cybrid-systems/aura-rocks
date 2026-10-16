@@ -1,0 +1,33 @@
+; lib/hot.aura — load the hot leaf defines (ws/hot.aura) into the workspace.
+;
+; The engine calls rk-checksum, rk-hash, rk-bloom-probe, rk-dec and
+; rk-block-seek by their global names. They are workspace defines (set-code +
+; eval-current), so aura-kernel-sink can swap one for a C kernel with
+; mutate:rebind and roll it back with hot-strategy:heal!; the engine always
+; calls whatever the name is bound to right now.
+;
+; Call (hot:load!) as a TOP-LEVEL STATEMENT of the main program, after the
+; requires and before using the engine. Two Aura bugs make the other places
+; unsafe:
+;  - loading from a module's top level (while it is required): after any later
+;    mutate:rebind / heal, module code calls the wrong global, e.g.
+;    leaf:checksum resolves to a 4-arg function (aura#4547);
+;  - loading lazily from inside db:open: a caller's `(define db (db:open ...))`
+;    is silently left unbound (aura#4546).
+; db:open checks hot:loaded? and fails with a clear message otherwise.
+; hot:load! replaces the workspace; aura-rocks owns it.
+(export hot:load! hot:source hot:names hot:loaded?)
+(require "ru" all:)
+
+(define (hot:source) (read-file (string-append (ru:root) "/ws/hot.aura")))
+(define (hot:names) (list "rk-checksum" "rk-hash" "rk-bloom-probe" "rk-dec" "rk-block-seek"))
+(define hot-loaded #f)
+(define (hot:loaded?) hot-loaded)
+(define (hot:load!)
+  (if hot-loaded #t
+      (let ((src (hot:source)))
+        (if (not (string? src)) (ru:fail "cannot read ws/hot.aura (set ROCKS_ROOT)") #f)
+        (set-code src)
+        (eval-current)
+        (set! hot-loaded #t)
+        #t)))

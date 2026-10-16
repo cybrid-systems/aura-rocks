@@ -1,0 +1,103 @@
+; lib/memtable.aura — skiplist memtable (RocksDB's default memtable shape).
+;
+; Nodes live in parallel growable vectors (key, type, value, tower); node 0
+; is the head; -1 is nil. Max height 12, branching 1/4 (own LCG, so a run is
+; deterministic). One node per user key: a put or delete of an existing key
+; overwrites it in place (no snapshots in the MVP, so older versions are not
+; kept). Deletes leave a tombstone node (type "D") that shadows older SSTs.
+;
+; mt = #(keys types vals towers count height rng bytes)
+(export mt:new mt:put! mt:get mt:count mt:bytes mt:first mt:seek mt:next mt:key mt:type mt:val mt:entries)
+(require "ru" all:)
+
+(define mt-max-height 12)
+(define (mt-tower h) (make-vector h -1))
+(define (mt:new)
+  (let ((cap 64))
+    (let ((keys (make-vector cap "")) (types (make-vector cap 0)) (vals (make-vector cap ""))
+          (towers (make-vector cap #f)))
+      (vector-set! towers 0 (mt-tower mt-max-height))
+      (vector keys types vals towers 1 1 12345 0))))
+
+(define (mt:count m) (- (vector-ref m 4) 1))
+(define (mt:bytes m) (vector-ref m 7))
+(define (mt:key m x) (vector-ref (vector-ref m 0) x))
+(define (mt:type m x) (vector-ref (vector-ref m 1) x))
+(define (mt:val m x) (vector-ref (vector-ref m 2) x))
+(define (mt-next m x lvl) (vector-ref (vector-ref (vector-ref m 3) x) lvl))
+(define (mt:next m x) (mt-next m x 0))
+(define (mt:first m) (mt-next m 0 0))
+
+(define (mt-grow! m)
+  (let* ((n (vector-ref m 4)) (cap (vector-length (vector-ref m 0))))
+    (if (< n cap) #t
+        (let ((cap2 (* cap 2)))
+          (let loop ((k 0) (ks (make-vector cap2 "")) (ts (make-vector cap2 0)) (vs (make-vector cap2 "")) (ws (make-vector cap2 #f)))
+            (if (< k n)
+                (begin
+                  (vector-set! ks k (vector-ref (vector-ref m 0) k))
+                  (vector-set! ts k (vector-ref (vector-ref m 1) k))
+                  (vector-set! vs k (vector-ref (vector-ref m 2) k))
+                  (vector-set! ws k (vector-ref (vector-ref m 3) k))
+                  (loop (+ k 1) ks ts vs ws))
+                (begin (vector-set! m 0 ks) (vector-set! m 1 ts) (vector-set! m 2 vs) (vector-set! m 3 ws) #t)))))))
+
+(define (mt-random-height! m)
+  (let loop ((h 1))
+    (let ((r (modulo (+ (* (vector-ref m 6) 1103515245) 12345) 2147483648)))
+      (vector-set! m 6 r)
+      (if (and (< h mt-max-height) (= (modulo (quotient r 65536) 4) 0)) (loop (+ h 1)) h))))
+
+; Walk down: preds[lvl] = last node with key < k. Returns the level-0
+; successor (first node with key >= k, or -1).
+(define (mt-find m k preds)
+  (let lvl-loop ((lvl (- (vector-ref m 5) 1)) (x 0))
+    (if (< lvl 0)
+        (mt-next m x 0)
+        (let walk ((x x))
+          (let ((y (mt-next m x lvl)))
+            (if (and (>= y 0) (string<? (mt:key m y) k))
+                (walk y)
+                (begin (if preds (vector-set! preds lvl x) #f) (lvl-loop (- lvl 1) x))))))))
+
+(define (mt:put! m k type v)
+  (let* ((preds (make-vector mt-max-height 0)) (y (mt-find m k preds)))
+    (if (and (>= y 0) (string=? (mt:key m y) k))
+        (begin
+          (vector-set! m 7 (+ (vector-ref m 7) (- (string-length v) (string-length (mt:val m y)))))
+          (vector-set! (vector-ref m 1) y type)
+          (vector-set! (vector-ref m 2) y v)
+          #f)
+        (let ((h (mt-random-height! m)))
+          (mt-grow! m)
+          (let ((x (vector-ref m 4)) (tw (mt-tower h)))
+            (if (> h (vector-ref m 5))
+                (let fill ((l (vector-ref m 5))) (if (< l h) (begin (vector-set! preds l 0) (fill (+ l 1))) (vector-set! m 5 h)))
+                #f)
+            (vector-set! (vector-ref m 0) x k)
+            (vector-set! (vector-ref m 1) x type)
+            (vector-set! (vector-ref m 2) x v)
+            (vector-set! (vector-ref m 3) x tw)
+            (let link ((l 0))
+              (if (< l h)
+                  (let ((p (vector-ref preds l)))
+                    (vector-set! tw l (mt-next m p l))
+                    (vector-set! (vector-ref (vector-ref m 3) p) l x)
+                    (link (+ l 1)))
+                  #t))
+            (vector-set! m 4 (+ x 1))
+            (vector-set! m 7 (+ (vector-ref m 7) (string-length k) (string-length v) 11))
+            #t)))))
+
+; #f (absent) or the node index (check mt:type for a tombstone).
+(define (mt:get m k)
+  (let ((y (mt-find m k #f)))
+    (if (and (>= y 0) (string=? (mt:key m y) k)) y #f)))
+
+; First node with key >= k (or -1).
+(define (mt:seek m k) (mt-find m k #f))
+
+; All nodes in key order as a list of (type key val).
+(define (mt:entries m)
+  (let loop ((x (mt:first m)) (acc (list)))
+    (if (< x 0) (ru:rev acc) (loop (mt:next m x) (cons (list (mt:type m x) (mt:key m x) (mt:val m x)) acc)))))

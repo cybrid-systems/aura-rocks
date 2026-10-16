@@ -1,0 +1,16 @@
+; lib/leaf.aura — the ONLY module that names the workspace hot leaves.
+;
+; Every engine module calls leaf:* instead of rk-* directly. Workaround for
+; aura#4547: after mutate:rebind / hot-strategy:heal! of a workspace define,
+; a module (loaded after the module that ran set-code + eval-current) whose
+; references to workspace defines are not in workspace definition order can
+; call a DIFFERENT define. Here they appear exactly in ws/hot.aura order, and
+; tests/test_leaf.aura rebinds each leaf and checks every leaf:* follows it.
+(export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek)
+(require "hot" all:)
+
+(define (leaf:checksum s start end) (rk-checksum s start end))
+(define (leaf:hash s seed) (rk-hash s seed))
+(define (leaf:bloom-probe bits nbits h k) (rk-bloom-probe bits nbits h k))
+(define (leaf:dec s off w) (rk-dec s off w))
+(define (leaf:block-seek blk key n ra) (rk-block-seek blk key n ra))

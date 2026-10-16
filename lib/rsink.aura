@@ -1,0 +1,78 @@
+; lib/rsink.aura — sink the engine's hot leaves with aura-kernel-sink.
+;
+; For each define in ws/hot.aura, policy:sink! (aura-kernel-sink lib/policy):
+;   profile the Soft define on real engine data -> SKIP below the floor
+;   vkgen ("S" byte-string kinds) + background cc -> content-addressed .so
+;   shadow gate against the live define (no mutation on mismatch: ABORT)
+;   one mutate:atomic-batch (slot + wrapper), eval-current, measured speedup
+;   vs (sink-min-speedup) -> KEEP, or hot-strategy:heal! back (ROLLBACK)
+; and one JSON row per decision in the trajectory file. The engine keeps
+; calling the names; a KEEP turns them into guarded C calls, a ROLLBACK
+; leaves the Soft body.
+;
+; Sample data is real engine data: a 4 KB data block written by
+; lib/block.aura, its keys, a bloom filter from lib/bloom.aura.
+(export rsink:sink-all! rsink:samples rsink:summary rsink:rows)
+(require "leaf" all:)
+(require "ru" all:)
+(require "entry" all:)
+(require "block" all:)
+(require "bloom" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "policy" all:)
+
+(define (rs-key i) (string-append "user" (ru:pad (* i 7919) 12)))
+(define (rs-val i) (let loop ((k 0) (acc (list))) (if (< k 100) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (+ i k) 26))) acc)) (list->string acc))))
+
+; #(blk n ra keys-vector bits nbits k hashes-vector digits)
+(define (rsink:samples)
+  (let* ((nk 36)
+         (keys (let loop ((i (- nk 1)) (acc (list))) (if (< i 0) acc (loop (- i 1) (cons (rs-key i) acc)))))
+         (blk (blk:build (let loop ((ks keys) (i 0) (acc (list))) (if (null? ks) (ru:rev acc) (loop (cdr ks) (+ i 1) (cons (entry:encode entry:put (car ks) (rs-val i)) acc))))))
+         (n (blk:count blk))
+         (f (bloom:parse (bloom:build (let loop ((i 0) (acc (list))) (if (< i 1000) (loop (+ i 1) (cons (rs-key i) acc)) acc)) 10)))
+         (hs (let ((v (make-vector 100 0))) (let loop ((i 0)) (if (< i 100) (begin (vector-set! v i (leaf:hash (rs-key (* 3 i)) 0)) (loop (+ i 1))) v)))))
+    (vector blk n (blk:ra blk n) (list->vector keys) (car f) (car (cdr f)) (car (cdr (cdr f))) hs
+            "000000000123456789987654321000042000999")))
+
+(define rsink-rows (list))
+(define (rsink:rows) rsink-rows)
+
+; plant: (plant:real), bound at top level by the caller (aura#4481).
+; only: #f (all) or a kernel name. floor-us: SKIP below this Soft us/call.
+; threshold: #f = workspace (sink-min-speedup). Returns the rows.
+(define (rsink:sink-all! plant s only floor-us threshold traj)
+  (let* ((blk (vector-ref s 0)) (n (vector-ref s 1)) (ra (vector-ref s 2)) (keys (vector-ref s 3))
+         (bits (vector-ref s 4)) (nbits (vector-ref s 5)) (bk (vector-ref s 6)) (hs (vector-ref s 7)) (digits (vector-ref s 8))
+         (L (string-length blk)) (nk (vector-length keys))
+         (run? (lambda (name) (or (not only) (equal? only name))))
+         (one! (lambda (name samples probe cases shadow bench-arg reps)
+                 (if (run? name)
+                     (let ((row (policy:sink! plant name samples probe cases shadow bench-arg reps floor-us threshold traj)))
+                       (policy:print row)
+                       (set! rsink-rows (cons row rsink-rows))
+                       row)
+                     #f))))
+    (one! "rk-checksum" (list blk 0 L) (lambda (k) (leaf:checksum blk 0 k))
+          (list 0 1 11 L) (list (list blk 0 L) (list blk 7 100) (list "Wikipedia" 0 9) (list "" 0 0)) L 10)
+    (one! "rk-hash" (list (vector-ref keys 3) 0) (lambda (k) (leaf:hash (vector-ref keys (modulo k nk)) k))
+          (list 0 1 7 99) (list (list (vector-ref keys 0) 0) (list "" 5) (list "a" 1) (list blk 7)) 3 200)
+    (one! "rk-bloom-probe" (list bits nbits (vector-ref hs 0) bk) (lambda (j) (leaf:bloom-probe bits nbits (vector-ref hs (modulo j 100)) bk))
+          (list 0 1 2 50 99) (list (list bits nbits (vector-ref hs 0) bk) (list bits nbits 12345 bk) (list bits nbits 0 1) (list "o" 6 3 2)) 3 200)
+    (one! "rk-dec" (list digits 0 6) (lambda (k) (leaf:dec digits (modulo k 30) 6))
+          (list 0 1 9 29) (list (list digits 0 6) (list digits 3 12) (list "7" 0 1) (list digits 5 0)) 9 300)
+    (one! "rk-block-seek" (list blk (vector-ref keys 5) n ra) (lambda (j) (leaf:block-seek blk (vector-ref keys (modulo (* j 7) nk)) n ra))
+          (list 0 1 5 17 30)
+          (list (list blk (vector-ref keys 0) n ra) (list blk "" n ra) (list blk "zzzz" n ra) (list blk "user0000" n ra)
+                (list blk (string-append (vector-ref keys 9) "0") n ra) (list blk (vector-ref keys (- nk 1)) n ra))
+          7 200)
+    (ru:rev rsink-rows)))
+
+; (keep rollback abort skip) over the rows of this process
+(define (rsink:summary)
+  (let loop ((rs rsink-rows) (k 0) (r 0) (a 0) (s 0))
+    (if (null? rs) (list k r a s)
+        (let ((d (policy:get (car rs) "decision")))
+          (loop (cdr rs) (if (equal? d "KEEP") (+ k 1) k) (if (equal? d "ROLLBACK") (+ r 1) r)
+                (if (equal? d "ABORT") (+ a 1) a) (if (equal? d "SKIP") (+ s 1) s))))))

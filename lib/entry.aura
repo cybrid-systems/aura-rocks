@@ -1,0 +1,30 @@
+; lib/entry.aura — the one record encoding used by WAL records and SST blocks.
+;
+;   entry = type(1) klen(4) vlen(6) key value
+;   type  "P" put | "D" delete (tombstone, empty value)
+; All fields are fixed-width ASCII decimal, so entries are 7-bit text and
+; rk-dec / rk-block-seek (ws/hot.aura) can parse them by offset.
+(export entry:encode entry:type-at entry:klen-at entry:vlen-at entry:key-at entry:val-at entry:size-at
+        entry:put entry:del entry:header entry:max-key entry:max-val)
+(require "leaf" all:)
+(require "ru" all:)
+
+(define entry:put 80)   ; #\P
+(define entry:del 68)   ; #\D
+(define entry:header 11)
+(define entry:max-key 9999)
+(define entry:max-val 999999)
+
+(define (entry:encode type key val)
+  (if (> (string-length key) entry:max-key) (ru:fail "key longer than " (number->string entry:max-key)) #f)
+  (if (> (string-length val) entry:max-val) (ru:fail "value longer than " (number->string entry:max-val)) #f)
+  (string-append (if (= type entry:del) "D" "P") (ru:pad (string-length key) 4) (ru:pad (string-length val) 6) key val))
+
+(define (entry:type-at s off) (string-ref s off))
+(define (entry:klen-at s off) (leaf:dec s (+ off 1) 4))
+(define (entry:vlen-at s off) (leaf:dec s (+ off 5) 6))
+(define (entry:key-at s off) (substring s (+ off 11) (+ off 11 (entry:klen-at s off))))
+(define (entry:val-at s off)
+  (let ((kl (entry:klen-at s off)))
+    (substring s (+ off 11 kl) (+ off 11 kl (entry:vlen-at s off)))))
+(define (entry:size-at s off) (+ 11 (entry:klen-at s off) (entry:vlen-at s off)))

@@ -1,0 +1,7 @@
+(define (f s) (set-code s) (eval-current) 42)
+(display "start") (newline)
+(define a (f "(define w (lambda (n) (letrec ((loop (lambda (i) (if (< i n) (loop (+ i 1)) i)))) (loop 0))))"))
+(display "after-define") (newline)
+(display (list "a" (try a (catch (e) (list "unbound:" e))))) (newline)
+(define b 5)
+(display (list "b" b)) (newline)

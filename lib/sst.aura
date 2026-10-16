@@ -1,0 +1,154 @@
+; lib/sst.aura — sorted string table: immutable file, written once.
+;
+;   [data block + cksum(10)]*  index + cksum(10)  filter + cksum(10)  footer
+;   index  = klen(4) smallest klen(4) largest nblocks(8)
+;            { klen(4) last-key off(12) size(8) }*        size includes cksum
+;   filter = lib/bloom.aura filter string (whole table)
+;   footer = idx-off(12) idx-size(12) flt-off(12) flt-size(12) count(12) "AROCKS01"
+; Every block, the index and the filter carry an Adler-32 (rk-checksum);
+; a mismatch is an error ("corruption"), never a wrong answer.
+;
+; The reader keeps the file contents in memory (a table cache, in place of
+; mmap) and verifies a data block's checksum each time it reads the block
+; (no block cache in the MVP).
+;
+; t  = #(path data idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size)
+; it = #(t bi block n ra ei)   (bi = nblocks: exhausted)
+(export sst:write sst:open sst:get sst:path sst:smallest sst:largest sst:count sst:size sst:nblocks
+        sst:iter sst:iter-first! sst:iter-seek! sst:iter-valid? sst:iter-next! sst:iter-key sst:iter-type sst:iter-val
+        sst:block-bytes sst:stats sst:stats-reset!)
+(require "leaf" all:)
+(require "ru" all:)
+(require "rio" all:)
+(require "entry" all:)
+(require "block" all:)
+(require "bloom" all:)
+
+(define sst:block-bytes 4096)
+(define sst-footer-size 68)
+(define sst-magic "AROCKS01")
+
+; counters: #(bloom-checks bloom-negatives block-reads)
+(define sst-counters (vector 0 0 0))
+(define (sst:stats) (list (cons "bloom_checks" (vector-ref sst-counters 0)) (cons "bloom_negatives" (vector-ref sst-counters 1))
+                          (cons "block_reads" (vector-ref sst-counters 2))))
+(define (sst:stats-reset!) (vector-set! sst-counters 0 0) (vector-set! sst-counters 1 0) (vector-set! sst-counters 2 0))
+(define (sst-bump! i) (vector-set! sst-counters i (+ 1 (vector-ref sst-counters i))))
+
+(define (sst-sealed s) (string-append s (ru:pad (leaf:checksum s 0 (string-length s)) 10)))
+
+; entries: list of (type key val), strictly increasing keys, non-empty.
+; Returns (path count size smallest largest).
+(define (sst:write path entries block-bytes bits-per-key)
+  (let loop ((es entries) (cur (list)) (cur-bytes 0) (last-key "") (off 0) (pieces (list)) (index (list)) (keys (list)) (count 0))
+    (if (or (null? es) (>= cur-bytes block-bytes))
+        ; flush the current block (if any)
+        (let* ((sealed (if (null? cur) #f (sst-sealed (blk:build (ru:rev cur)))))
+               (pieces2 (if sealed (cons sealed pieces) pieces))
+               (index2 (if sealed (cons (string-append (ru:pad (string-length last-key) 4) last-key (ru:pad off 12) (ru:pad (string-length sealed) 8)) index) index))
+               (off2 (if sealed (+ off (string-length sealed)) off)))
+          (if (not (null? es))
+              (loop es (list) 0 last-key off2 pieces2 index2 keys count)
+              (let* ((rkeys (ru:rev keys))
+                     (smallest (car rkeys)) (largest last-key)
+                     (idx (sst-sealed (ru:concat (append (list (ru:pad (string-length smallest) 4) smallest (ru:pad (string-length largest) 4) largest (ru:pad (ru:len index2) 8)) (ru:rev index2)))))
+                     (flt (sst-sealed (bloom:build rkeys bits-per-key)))
+                     (footer (string-append (ru:pad off2 12) (ru:pad (string-length idx) 12) (ru:pad (+ off2 (string-length idx)) 12) (ru:pad (string-length flt) 12) (ru:pad count 12) sst-magic))
+                     (data (ru:concat (append (ru:rev pieces2) (list idx flt footer)))))
+                (rio:write path data)
+                (list path count (string-length data) smallest largest))))
+        (let* ((e (car es)) (enc (entry:encode (car e) (car (cdr e)) (car (cdr (cdr e))))))
+          (loop (cdr es) (cons enc cur) (+ cur-bytes (string-length enc) 6) (car (cdr e)) off pieces index (cons (car (cdr e)) keys) (+ count 1))))))
+
+(define (sst-check! data start len what path)
+  (let ((ck (leaf:dec data (+ start len -10) 10)))
+    (if (= ck (leaf:checksum data start (+ start len -10))) #t
+        (ru:fail "corruption: " what " checksum mismatch in " path))))
+
+(define (sst:open path)
+  (let ((data (rio:read path)))
+    (if (not data) (ru:fail "cannot read " path) #f)
+    (let ((n (string-length data)))
+      (if (or (< n sst-footer-size) (not (string=? (substring data (- n 8) n) sst-magic)))
+          (ru:fail "corruption: bad footer in " path) #f)
+      (let* ((f (- n sst-footer-size))
+             (idx-off (leaf:dec data f 12)) (idx-size (leaf:dec data (+ f 12) 12))
+             (flt-off (leaf:dec data (+ f 24) 12)) (flt-size (leaf:dec data (+ f 36) 12))
+             (count (leaf:dec data (+ f 48) 12)))
+        (sst-check! data idx-off idx-size "index" path)
+        (sst-check! data flt-off flt-size "filter" path)
+        (let* ((p idx-off)
+               (sl (leaf:dec data p 4)) (smallest (substring data (+ p 4) (+ p 4 sl)))
+               (p2 (+ p 4 sl)) (ll (leaf:dec data p2 4)) (largest (substring data (+ p2 4) (+ p2 4 ll)))
+               (p3 (+ p2 4 ll)) (nb (leaf:dec data p3 8))
+               (keys (make-vector nb "")) (offs (make-vector nb 0)) (sizes (make-vector nb 0)))
+          (let each ((i 0) (q (+ p3 8)))
+            (if (< i nb)
+                (let ((kl (leaf:dec data q 4)))
+                  (vector-set! keys i (substring data (+ q 4) (+ q 4 kl)))
+                  (vector-set! offs i (leaf:dec data (+ q 4 kl) 12))
+                  (vector-set! sizes i (leaf:dec data (+ q 16 kl) 8))
+                  (each (+ i 1) (+ q 24 kl)))
+                #t))
+          (vector path data keys offs sizes nb (bloom:parse (substring data flt-off (+ flt-off flt-size -10)))
+                  smallest largest count n))))))
+
+(define (sst:path t) (vector-ref t 0))
+(define (sst:nblocks t) (vector-ref t 5))
+(define (sst:smallest t) (vector-ref t 7))
+(define (sst:largest t) (vector-ref t 8))
+(define (sst:count t) (vector-ref t 9))
+(define (sst:size t) (vector-ref t 10))
+
+; first block whose last key >= key (nblocks if none)
+(define (sst-find-block t key)
+  (let ((keys (vector-ref t 2)))
+    (let loop ((lo 0) (hi (vector-ref t 5)))
+      (if (>= lo hi) lo
+          (let ((m (quotient (+ lo hi) 2)))
+            (if (string<? (vector-ref keys m) key) (loop (+ m 1) hi) (loop lo m)))))))
+
+; verified block content (without its checksum)
+(define (sst-block t i)
+  (let ((data (vector-ref t 1)) (off (vector-ref (vector-ref t 3) i)) (size (vector-ref (vector-ref t 4) i)))
+    (sst-bump! 2)
+    (sst-check! data off size "block" (vector-ref t 0))
+    (substring data off (+ off size -10))))
+
+; #f, or (type . val) for key
+(define (sst:get t key use-bloom)
+  (if (or (string<? key (vector-ref t 7)) (string<? (vector-ref t 8) key)) #f
+      (if (and use-bloom (begin (sst-bump! 0) (not (bloom:may? (vector-ref t 6) key))))
+          (begin (sst-bump! 1) #f)
+          (let ((bi (sst-find-block t key)))
+            (if (>= bi (vector-ref t 5)) #f
+                (let* ((b (sst-block t bi)) (n (blk:count b)) (ra (blk:ra b n)) (i (blk:seek b key n ra)))
+                  (if (>= i n) #f
+                      (let ((off (blk:off b ra i)))
+                        (if (string=? (blk:key b off) key) (cons (blk:type b off) (blk:val b off)) #f)))))))))
+
+; ---- iterator
+(define (sst:iter t) (vector t (vector-ref t 5) "" 0 0 0))
+(define (sst-set! it bi b ei)
+  (let ((n (blk:count b)))
+    (vector-set! it 1 bi) (vector-set! it 2 b) (vector-set! it 3 n) (vector-set! it 4 (blk:ra b n)) (vector-set! it 5 ei)
+    (if (>= ei n) (sst-load! it (+ bi 1) 0) it)))
+(define (sst-load! it bi ei)
+  (let ((t (vector-ref it 0)))
+    (if (>= bi (vector-ref t 5))
+        (begin (vector-set! it 1 bi) it)
+        (sst-set! it bi (sst-block t bi) ei))))
+(define (sst:iter-first! it) (sst-load! it 0 0))
+(define (sst:iter-seek! it key)
+  (let* ((t (vector-ref it 0)) (bi (sst-find-block t key)))
+    (if (>= bi (vector-ref t 5)) (begin (vector-set! it 1 bi) it)
+        (let* ((b (sst-block t bi)) (n (blk:count b)))
+          (sst-set! it bi b (blk:seek b key n (blk:ra b n)))))))
+(define (sst:iter-valid? it) (< (vector-ref it 1) (vector-ref (vector-ref it 0) 5)))
+(define (sst:iter-next! it)
+  (let ((ei (+ 1 (vector-ref it 5))))
+    (if (< ei (vector-ref it 3)) (begin (vector-set! it 5 ei) it) (sst-load! it (+ 1 (vector-ref it 1)) 0))))
+(define (sst-cur-off it) (blk:off (vector-ref it 2) (vector-ref it 4) (vector-ref it 5)))
+(define (sst:iter-key it) (blk:key (vector-ref it 2) (sst-cur-off it)))
+(define (sst:iter-type it) (blk:type (vector-ref it 2) (sst-cur-off it)))
+(define (sst:iter-val it) (blk:val (vector-ref it 2) (sst-cur-off it)))

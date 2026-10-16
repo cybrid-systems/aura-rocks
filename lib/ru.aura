@@ -1,0 +1,29 @@
+; lib/ru.aura — small helpers shared by the engine (no std list closures).
+(export ru:pad ru:concat ru:rev ru:len ru:root ru:path ru:fail ru:max ru:min ru:ascii?)
+
+; n as a zero-padded decimal field of width w (n >= 0, fits in w digits).
+(define (ru:pad n w)
+  (let ((s (number->string n)))
+    (if (> (string-length s) w)
+        (error (string-append "aura-rocks: field overflow: " s " does not fit " (number->string w) " digits"))
+        (let loop ((s s)) (if (< (string-length s) w) (loop (string-append "0" s)) s)))))
+
+; Concatenate a list of strings in one primitive call.
+(define (ru:concat parts) (if (null? parts) "" (apply string-append parts)))
+
+(define (ru:rev xs) (let loop ((xs xs) (acc (list))) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))))
+(define (ru:len xs) (let loop ((xs xs) (n 0)) (if (null? xs) n (loop (cdr xs) (+ n 1)))))
+(define (ru:max a b) (if (> a b) a b))
+(define (ru:min a b) (if (< a b) a b))
+
+; Repo root: $ROCKS_ROOT, else ".".
+(define (ru:root)
+  (let ((r (getenv "ROCKS_ROOT"))) (if (and (string? r) (> (string-length r) 0)) r ".")))
+(define (ru:path dir name) (string-append dir "/" name))
+(define (ru:fail . parts) (error (ru:concat (cons "aura-rocks: " parts))))
+
+; Keys and values are 7-bit strings: Aura string-ref / string-length count
+; code points while files and C kernels see UTF-8 bytes.
+(define (ru:ascii? s)
+  (let ((n (string-length s)))
+    (let loop ((i 0)) (cond ((>= i n) #t) ((> (string-ref s i) 127) #f) (else (loop (+ i 1)))))))

@@ -1,0 +1,111 @@
+; scripts/bench.aura — db_bench-style workloads on aura-rocks.
+;
+;   fillseq     N puts, keys in order, fresh DB
+;   fillrandom  N puts, keys in pseudo-random order, fresh DB
+;   readrandom  N gets of random existing keys (on the fillrandom DB, after
+;               a flush, so reads go through L0/L1 SSTs: bloom, index,
+;               checksum-verified block, block seek)
+;   readseq     full scan of the fillrandom DB (merging iterator)
+;   readmissing N gets of absent keys (bloom filter path)
+; Keys "user" + 12 digits (16 bytes), values BENCH_VALUE bytes (default 100).
+;
+; BENCH_SINK=1 first runs the sink policy (lib/rsink.aura) in this process:
+; the engine is the same, only the hot leaves it calls may now be C kernels.
+; Env: BENCH_N (default 2000), BENCH_VALUE, BENCH_SINK, BENCH_DIR,
+;      BENCH_OUT (JSON lines appended, default build/bench.jsonl), BENCH_TAG.
+(require "ru" all:)
+(require "rio" all:)
+(require "hot" all:)
+(require "db" all:)
+(require "sst" all:)
+(require "rsink" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "policy" all:)
+(hot:load!)   ; top-level statement: see lib/hot.aura (aura#4546, aura#4547)
+
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define N (string->number (env-or "BENCH_N" "2000")))
+(define VLEN (string->number (env-or "BENCH_VALUE" "100")))
+(define SINK (equal? (env-or "BENCH_SINK" "0") "1"))
+(define DIR (env-or "BENCH_DIR" (string-append (ru:root) "/build/bench-db")))
+(define OUT (env-or "BENCH_OUT" (string-append (ru:root) "/build/bench.jsonl")))
+(define TAG (env-or "BENCH_TAG" (if SINK "sink" "soft")))
+
+(define plant (plant:real))
+(score:set-rounds! 3)
+(define sink-rows (list))
+(if SINK
+    (begin (set! sink-rows (rsink:sink-all! plant (rsink:samples) #f 50 #f (string-append (ru:root) "/build/trajectory-bench.jsonl"))) #t)
+    #f)
+(define (kept) (let loop ((rs sink-rows) (acc (list))) (if (null? rs) (ru:rev acc) (loop (cdr rs) (if (equal? (policy:get (car rs) "decision") "KEEP") (cons (policy:get (car rs) "name") acc) acc)))))
+
+(define (key i) (string-append "user" (ru:pad i 12)))
+(define value (list->string (let loop ((k 0) (acc (list))) (if (< k VLEN) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (* k 7) 26))) acc)) acc))))
+(define seed 301)
+(define (rnd! m) (set! seed (modulo (+ (* seed 1103515245) 12345) 2147483648)) (modulo (quotient seed 16) m))
+; a permutation of 0..N-1 (random order, every key once) for fillrandom
+(define (perm n)
+  (let ((v (make-vector n 0)))
+    (let fill ((i 0)) (if (< i n) (begin (vector-set! v i i) (fill (+ i 1))) #t))
+    (let shuf ((i (- n 1)))
+      (if (> i 0) (let* ((j (rnd! (+ i 1))) (t (vector-ref v i))) (vector-set! v i (vector-ref v j)) (vector-set! v j t) (shuf (- i 1))) v))))
+
+(define results (list))
+(define (report! name ops ms extra)
+  (let ((us (if (> ops 0) (/ (* 1000.0 ms) ops) 0.0)) (ops-s (if (> ms 0) (/ (* 1000.0 ops) ms) 0.0)))
+    (display (string-append "  " name " ")) (display ops) (display " ops in ") (display ms) (display " ms: ")
+    (display us) (display " us/op, ") (display ops-s) (display " ops/s") (display extra) (newline)
+    (set! results (cons (list name ops ms us ops-s) results))))
+(define (now) (current-time-ms))
+
+(display (string-append "aura-rocks bench (" TAG "): N=" (number->string N) " value=" (number->string VLEN) " io=" (begin (rio:init!) (rio:mode)) " kept=")) (display (kept)) (newline)
+
+; fillseq
+(db:destroy! DIR)
+(define db #f)
+(set! db (db:open DIR #f))
+(define t0 (now))
+(let loop ((i 0)) (if (< i N) (begin (db:put! db (key i) value) (loop (+ i 1))) #t))
+(report! "fillseq" N (- (now) t0) "")
+
+; fillrandom
+(define (step s) (if (equal? (getenv "BENCH_TRACE") "1") (begin (display (string-append "  [trace] " s)) (newline)) #f))
+(step "destroy")
+(db:destroy! DIR)
+(step "open")
+(set! db (db:open DIR #f))
+(step "perm")
+(define order (perm N))
+(step "fill")
+(set! t0 (now))
+(let loop ((i 0)) (if (< i N) (begin (db:put! db (key (vector-ref order i)) value) (loop (+ i 1))) #t))
+(report! "fillrandom" N (- (now) t0) "")
+(db:flush! db)
+(define (stat name) (let loop ((s (db:stats db))) (cond ((null? s) #f) ((equal? (car (car s)) name) (cdr (car s))) (else (loop (cdr s))))))
+(display "  after fill: ") (display (list (cons "flushes" (stat "flushes")) (cons "compactions" (stat "compactions")) (cons "l0" (stat "l0_files")) (cons "l1" (stat "l1_files")))) (newline)
+
+; readrandom
+(define found 0)
+(set! t0 (now))
+(let loop ((i 0)) (if (< i N) (begin (if (db:get db (key (rnd! N))) (set! found (+ found 1)) #f) (loop (+ i 1))) #t))
+(report! "readrandom" N (- (now) t0) (string-append " (" (number->string found) " of " (number->string N) " found)"))
+
+; readseq
+(set! t0 (now))
+(define scanned (ru:len (db:scan db "" #f #f)))
+(report! "readseq" scanned (- (now) t0) "")
+
+; readmissing
+(sst:stats-reset!)
+(set! t0 (now))
+(define hits 0)
+(let loop ((i 0)) (if (< i N) (begin (if (db:get db (string-append (key (rnd! N)) "x")) (set! hits (+ hits 1)) #f) (loop (+ i 1))) #t))
+(report! "readmissing" N (- (now) t0) (string-append " (bloom negatives " (number->string (cdr (car (cdr (sst:stats))))) ")"))
+
+(define (jrow r) (string-append "{\"tag\":\"" TAG "\",\"bench\":\"" (car r) "\",\"n\":" (number->string N) ",\"value\":" (number->string VLEN)
+                                ",\"ops\":" (number->string (car (cdr r))) ",\"ms\":" (number->string (car (cdr (cdr r))))
+                                ",\"us_per_op\":" (number->string (car (cdr (cdr (cdr r))))) ",\"ops_per_s\":" (number->string (car (cdr (cdr (cdr (cdr r))))))
+                                ",\"kept\":\"" (let j ((ks (kept)) (acc "")) (if (null? ks) acc (j (cdr ks) (string-append acc (if (equal? acc "") "" " ") (car ks))))) "\"}\n"))
+(let loop ((rs (ru:rev results))) (if (null? rs) #t (begin (rio:append! OUT (jrow (car rs)) #f) (loop (cdr rs)))))
+(display (string-append "results appended to " OUT)) (newline)
