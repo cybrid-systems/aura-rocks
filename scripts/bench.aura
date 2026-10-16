@@ -11,7 +11,7 @@
 ;
 ; BENCH_SINK=1 first runs the sink policy (lib/rsink.aura) in this process:
 ; the engine is the same, only the hot leaves it calls may now be C kernels.
-; Env: BENCH_N (default 2000), BENCH_VALUE, BENCH_SINK, BENCH_DIR,
+; Env: BENCH_N (default 2000), BENCH_VALUE, BENCH_SINK, BENCH_KEEP, BENCH_DIR,
 ;      BENCH_OUT (JSON lines appended, default build/bench.jsonl), BENCH_TAG.
 (require "ru" all:)
 (require "rio" all:)
@@ -30,7 +30,7 @@
 (define SINK (equal? (env-or "BENCH_SINK" "0") "1"))
 (define DIR (env-or "BENCH_DIR" (string-append (ru:root) "/build/bench-db")))
 (define OUT (env-or "BENCH_OUT" (string-append (ru:root) "/build/bench.jsonl")))
-(define TAG (env-or "BENCH_TAG" (if SINK "sink" "soft")))
+(define TAG (env-or "BENCH_TAG" (if (or SINK (> (string-length (env-or "BENCH_KEEP" "")) 0)) "sink" "soft")))
 
 (define plant (plant:real))
 (score:set-rounds! 3)
@@ -38,7 +38,13 @@
 (if SINK
     (begin (set! sink-rows (rsink:sink-all! plant (rsink:samples) #f 50 #f (string-append (ru:root) "/build/trajectory-bench.jsonl"))) #t)
     #f)
-(define (kept) (let loop ((rs sink-rows) (acc (list))) (if (null? rs) (ru:rev acc) (loop (cdr rs) (if (equal? (policy:get (car rs) "decision") "KEEP") (cons (policy:get (car rs) "name") acc) acc)))))
+; BENCH_KEEP=name,name,..: no policy run, install just those kernels (the
+; KEEP set of an earlier policy run): the workloads then run in a process
+; that did not first spend minutes in the policy's Soft reference runs
+(define KEEPS (env-or "BENCH_KEEP" ""))
+(define kept-only (if (> (string-length KEEPS) 0) (rsink:install-only! KEEPS) (list)))
+(define (kept) (if (not (null? kept-only)) kept-only (kept-rows)))
+(define (kept-rows) (let loop ((rs sink-rows) (acc (list))) (if (null? rs) (ru:rev acc) (loop (cdr rs) (if (equal? (policy:get (car rs) "decision") "KEEP") (cons (policy:get (car rs) "name") acc) acc)))))
 
 (define (key i) (string-append "user" (ru:pad i 12)))
 (define value (list->string (let loop ((k 0) (acc (list))) (if (< k VLEN) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (* k 7) 26))) acc)) acc))))

@@ -1,0 +1,38 @@
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_checksum_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-checksum: KEEP stage=score reasons=() speedup=219.0 threshold=1.5 soft-us/call=21400.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_hash_k_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-hash: ROLLBACK stage=score reasons=(too-slow) speedup=0.9545454545454546 threshold=1.5 soft-us/call=100.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_dec_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-dec: ROLLBACK stage=score reasons=(too-slow) speedup=1.303030303030303 threshold=1.5 soft-us/call=86.66666666666667
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_block_seek_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-block-seek: KEEP stage=score reasons=() speedup=5.416666666666667 threshold=1.5 soft-us/call=930.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_pad_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-pad: KEEP stage=score reasons=() speedup=5.466666666666667 threshold=1.5 soft-us/call=233.33333333333334
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_entry_encode_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-entry-encode: KEEP stage=score reasons=() speedup=2.2222222222222223 threshold=1.5 soft-us/call=390.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_wal_record_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-wal-record: KEEP stage=score reasons=() speedup=5.696969696969697 threshold=1.5 soft-us/call=990.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_block_build_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-block-build: KEEP stage=score reasons=() speedup=79.0 threshold=1.5 soft-us/call=4000.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_bloom_build_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-bloom-build: KEEP stage=score reasons=() speedup=1155.0 threshold=1.5 soft-us/call=208666.66666666666
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_bloom_may_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-bloom-may: ROLLBACK stage=score reasons=(too-slow) speedup=1.0858895705521472 threshold=1.5 soft-us/call=790.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_block_get_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-block-get: KEEP stage=score reasons=() speedup=8.28125 threshold=1.5 soft-us/call=1300.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_cache_sim_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-cache-sim: KEEP stage=score reasons=() speedup=1505.0 threshold=1.5 soft-us/call=239333.33333333334
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_sst_build_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-sst-build: KEEP stage=score reasons=() speedup=2047.0 threshold=1.5 soft-us/call=682000.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_sst_merge_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-sst-merge: KEEP stage=score reasons=() speedup=2611.0 threshold=1.5 soft-us/call=180002000.0
+[aura:aot] aura_reload_aot_module: loaded /workspace/wt-final/build/kernels/libcsink_rk_scan_2118865956.so (aot_emit_version=0, module_version=0)
+  [policy] rk-scan: KEEP stage=score reasons=() speedup=108.11111111111111 threshold=1.5 soft-us/call=122800.0
+aura-rocks bench (after-sink): N=2000 value=100 io=ffi kept=(rk-checksum rk-block-seek rk-pad rk-entry-encode rk-wal-record rk-block-build rk-bloom-build rk-block-get rk-cache-sim rk-sst-build rk-sst-merge rk-scan)
+  fillseq 2000 ops in 36736 ms: 18368.0 us/op, 54.44250871080139 ops/s
+  fillrandom 2000 ops in 35843 ms: 17921.5 us/op, 55.798900761655 ops/s
+  after fill: ((flushes . 4) (compactions . 1) (l0 . 0) (l1 . 2))
+  readrandom 2000 ops in 32065 ms: 16032.5 us/op, 62.37330422579136 ops/s (2000 of 2000 found)
+  readseq 2000 ops in 3815 ms: 1907.5 us/op, 524.2463958060289 ops/s
+  readmissing 2000 ops in 28197 ms: 14098.5 us/op, 70.92953151044438 ops/s (bloom negatives 1963)
+results appended to /workspace/benchfinal/after-sink-bench-base-1.jsonl

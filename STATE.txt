@@ -2,18 +2,20 @@
 aura_repo=https://github.com/cybrid-systems/aura
 aura_tip=89cbd6c2b   # main 2026-10-16; needed for aura#4537 (list corruption after ~100 workspace calls, reproduced on 542fb9254) and #4531/#4532
 aura_face=soft       # AURA_SANDBOX=off AURA_PIPELINE_STRICT=0, image ghcr.io/cybrid-systems/dev:v1.0.9
-kernel_sink=third_party/aura-kernel-sink @ 3df9665 (vkgen S kind = byte-string params)
+kernel_sink=third_party/aura-kernel-sink @ 3bdab5f (csink host slots: policy:sink-host!; c-func <= 6 args)
 wal=real             # lib/wal.aura: "R" len(8) adler32(10) payload; O_APPEND via kernels/rocks_io.c (pure read+rewrite fallback, ROCKS_PURE_IO=1); replay stops at first torn/corrupt record
 memtable=real        # lib/memtable.aura: skiplist (height 12, p=1/4) on parallel vectors; tombstones; flush at memtable_bytes
 sstable=real         # lib/sst.aura: data blocks (restart array) + cksum, index + cksum, bloom + cksum, 68-byte footer "AROCKS01"; point get + iterator
 read_path=real       # memtable -> L0 newest-first -> L1 (bloom-checked)
-compaction=real      # L0+L1 -> L1 k-way merge (lib/merge.aura), overwritten + tombstoned keys dropped, split at target_file_bytes
+compaction=real      # L0+L1 -> L1 k-way merge (rk-sst-merge kernel, lib/merge.aura module path as fallback), overwritten + tombstoned keys dropped, split at target_file_bytes
 manifest=real        # MANIFEST written to tmp + rename
-kernel_sink=real     # lib/rsink.aura + scripts/sink.aura: policy:sink! on rk-checksum, rk-hash, rk-bloom-probe, rk-dec, rk-block-seek with engine data; KEEP/ROLLBACK/SKIP JSONL
+kernel_sink=real     # lib/rsink.aura: policy:sink-host! of 15 hand-written C kernels (kernels/rocks_leaves.c) into lib/leaf.aura host slots; fine + record/block + whole-table (rk-sst-build, rk-sst-merge, rk-scan); KEEP 12, ROLLBACK hash/dec/bloom-may; Aura refs in ws/hot.aura
 hot_load=top-level   # (hot:load!) must be a top-level statement of the main program (aura#4546, aura#4547)
 memtable_reps=skiplist,vector,hash   # lib/mem.aura; chosen per rotation or live-migrated (rk-memtable-rep)
 compaction_styles=leveled,tiered     # sorted runs, MANIFEST v2; rk-compaction-style rk-l0-trigger rk-max-runs
 block_cache=lru,lfu,clock            # lib/cache.aura, block_cache_blocks (0 = off), live policy switch (rk-cache-policy); bloom_reads (rk-bloom-reads)
 adaptive=real        # lib/obs.aura + lib/adapt.aura: rule policy -> gate -> mutate:rebind -> post check -> rollback; JSONL trajectories -> aura-loop --adapt-ingest/--adapt-propose
-adaptive_result=switches work and are correct; adaptive loses overall to the best static config (37.0 vs 26.5 ms/op, cache 61.3 vs 52.6) because of Soft gate cost and EMA lag; docs/adaptive.md
-gaps=block cache process-wide and block-counted; controller gates in Soft are expensive; no compaction shadow gate; no snapshots/iterators over live writes; two levels; ASCII keys/values; merge step not sunk (primitive string<?); single-threaded
+adaptive_result=with sink 2026-10-16: adaptive 20.7 ms/op beats every pre-sink config (best 28.2) but loses to the best static of the same build (13.6); controller overhead 24.6 s -> 11.4 s; cache bench 20.1 vs best 15.6 (none); docs/adaptive.md docs/bench.md
+gaps=block cache process-wide and block-counted; controller gates in Soft are expensive; no compaction shadow gate; no snapshots/iterators over live writes; two levels; ASCII keys/values; memtable / bloom check / obs still Soft; memtable replay gate Soft; pure Soft mode 10-40% slower than b3d934c; single-threaded
+bench_2026_10_16=docs/bench-2026-10-16 (before b3d934c vs after ff22974 soft/sink/kept)
+aura_issues_new=4550,4551,4552,4553

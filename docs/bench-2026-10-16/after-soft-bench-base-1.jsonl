@@ -1,0 +1,5 @@
+{"tag":"after-soft","bench":"fillseq","n":2000,"value":100,"ops":2000,"ms":33066,"us_per_op":16533.0,"ops_per_s":60.48509042521019,"kept":""}
+{"tag":"after-soft","bench":"fillrandom","n":2000,"value":100,"ops":2000,"ms":32808,"us_per_op":16404.0,"ops_per_s":60.960741282613995,"kept":""}
+{"tag":"after-soft","bench":"readrandom","n":2000,"value":100,"ops":2000,"ms":61424,"us_per_op":30712.0,"ops_per_s":32.560562646522534,"kept":""}
+{"tag":"after-soft","bench":"readseq","n":2000,"value":100,"ops":2000,"ms":18166,"us_per_op":9083.0,"ops_per_s":110.09578333149841,"kept":""}
+{"tag":"after-soft","bench":"readmissing","n":2000,"value":100,"ops":2000,"ms":22363,"us_per_op":11181.5,"ops_per_s":89.43343916290301,"kept":""}

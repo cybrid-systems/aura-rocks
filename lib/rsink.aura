@@ -16,7 +16,7 @@
 ;
 ; Sample data is real engine data: a 4 KB data block written by
 ; lib/block.aura, its keys, a bloom filter from lib/bloom.aura.
-(export rsink:sink-all! rsink:install-all! rsink:kernels rsink:samples rsink:summary rsink:rows)
+(export rsink:sink-all! rsink:install-all! rsink:install-only! rsink:kernels rsink:samples rsink:summary rsink:rows)
 (require "leaf" all:)
 (require "ru" all:)
 (require "entry" all:)
@@ -177,6 +177,16 @@
         (list "rk-block-get" "rk_block_get" (list "S" "S") "S") (list "rk-cache-sim" "rk_cache_sim" (list "I" "I" "S") "I")
         (list "rk-sst-build" "rk_sst_build" (list "S" "I" "I") "S") (list "rk-sst-merge" "rk_sst_merge" (list "S" "I" "I" "I" "I") "S")
         (list "rk-scan" "rk_scan" (list "S" "S" "I" "I") "S")))
+;; install only the kernels named in a comma-separated list (no scoring)
+(define (rsink:install-only! only)
+  (let ((csrc (string-append (ru:root) "/kernels/rocks_leaves.c")))
+    (let loop ((ks (rsink:kernels)) (acc (list)))
+      (if (null? ks) (ru:rev acc)
+          (let* ((k (car ks)))
+            (if (not (rs-in? (car k) only)) (loop (cdr ks) acc)
+                (let* ((so (csink:build! csrc (list-ref k 1)))
+                       (f (if so (csink:load so (list-ref k 1) (list-ref k 2) (list-ref k 3)) #f)))
+                  (if f (begin (leaf:install! (car k) f) (loop (cdr ks) (cons (car k) acc))) (loop (cdr ks) acc)))))))))
 ;; tests: build + load + install every kernel, no scoring (the "sink
 ;; everything" configuration). Returns the names installed.
 (define (rsink:install-all!)

@@ -1,0 +1,5 @@
+{"tag":"before-soft","bench":"fillseq","n":2000,"value":100,"ops":2000,"ms":29895,"us_per_op":14947.5,"ops_per_s":66.9008195350393,"kept":""}
+{"tag":"before-soft","bench":"fillrandom","n":2000,"value":100,"ops":2000,"ms":29359,"us_per_op":14679.5,"ops_per_s":68.12221124697707,"kept":""}
+{"tag":"before-soft","bench":"readrandom","n":2000,"value":100,"ops":2000,"ms":56405,"us_per_op":28202.5,"ops_per_s":35.45784948142895,"kept":""}
+{"tag":"before-soft","bench":"readseq","n":2000,"value":100,"ops":2000,"ms":14299,"us_per_op":7149.5,"ops_per_s":139.86992097349466,"kept":""}
+{"tag":"before-soft","bench":"readmissing","n":2000,"value":100,"ops":2000,"ms":17703,"us_per_op":8851.5,"ops_per_s":112.97520194317347,"kept":""}

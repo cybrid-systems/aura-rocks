@@ -139,12 +139,56 @@ Block cache hit rates over the whole run were:
   - It does make the right call on hits: it rejects LFU in E1, swaps to LFU in E2, and rejects going back to LRU in E3.
 - **Bloom-off is a measured loss.** In the first adaptive run, `bloom_reads` switched off in the all-hit phases and then had to come back in E4. E4 went from 7.6 to 22.9 ms/op while the filters were off, and E1 got slower too. Filter checks use the sunk-able `rk-hash` and are cheap, so skipping them saves little. The default `bloom_off_miss` is now 0 (never off); the knob stays as a proposal parameter. With that default, E4 runs 17.2 ms/op, which is still controller overhead.
 
+## With the kernel sink (2026-10-16, ff22974)
+
+These are one run per config, 6 processes at a time on the 8-core box; full tables are in [docs/bench.md](bench.md), raw rows in `docs/bench-2026-10-16/`.
+- **before** is b3d934c in Soft.
+- **after sink** has all 15 C kernels installed (`BENCH_SINK=1` → `rsink:install-all!`).
+
+These numbers use the default options of the bench scripts. They are not the 2-run means above, so compare within this table only.
+
+Controller pre-swap costs and what changed:
+
+| cost | before | after sink |
+|---|---|---|
+| cache gate: simulate 3 policies over 512 accesses | Soft, about 0.24 s per policy (4.6 s per run) | one rk-cache-sim call per policy (1505×), trace joined once |
+| tiered → leveled collapse (a full merge) | Soft k-way merge, ~16 s per run | one rk-sst-merge call (2611× on the policy sample) |
+| memtable gate: replay of 256 ops | Soft | still Soft: the memtable structures (skiplist / vector / hash) are Aura data |
+
+Phase bench totals, ms/op:
+
+| | before | after sink |
+|---|---|---|
+| best static | 28.2 (hash:tiered) | 13.6 (skiplist:tiered) |
+| adaptive | 39.6 | 20.7 |
+| adaptive / best static | 1.41× | 1.52× |
+| `adapt_overhead_ms` per run | 24584 | 11409 |
+
+Cache bench totals, ms/op:
+
+| | before | after sink |
+|---|---|---|
+| best static | 51.0 (lru) | 15.6 (none) |
+| adaptive | 59.4 | 20.1 |
+| `adapt_overhead_ms` per run | 4289 | 972 |
+
+What changed:
+- **The controller is 2.2–4.4× cheaper.** Its overhead went from 24.6 s to 11.4 s per phase-bench run and from 4.3 s to 1.0 s per cache-bench run.
+- **Adaptive with the sink beats every static config from before.** Phase bench: 20.7 vs 28.2. Cache bench: 20.1 vs 51.0.
+- **The goal, adaptive beating the best static config of the same build, is not met.**
+  - The engine got 2–4× faster at the same time as the controller, so the controller's remaining cost is still a large share of a run: 11.4 s of ~51 s in the phase bench.
+  - That remaining cost is mostly the Soft memtable replay gate and live migrations.
+  - Adaptive also still loses B and D: the collapse before B, and leveled during D until the EMA catches up.
+- **In the cache bench the right answer is now "no cache".** With block checksums in C, every policy costs more than it saves. The controller cannot pick "none": it only switches among lru, lfu and clock.
+
 ## Gaps
 
 - **Policy quality.** The rule thresholds are hand defaults. Two benchmark runs give aura-loop too few realized transitions to move them, so a real loop needs many more labelled runs, and phase-shift detection that beats the EMA and cooldown lag.
 - **Controller cost.**
-  - Gates run in Soft: the memtable replay and the cache simulation each cost about as much as the work they guard.
-  - Two fixes are not done yet: sinking the replay and simulation leaves, and running gates on a sample.
+  - The cache simulation and the compaction collapse are sunk (rk-cache-sim, rk-sst-merge).
+  - The memtable replay gate still runs in Soft on Aura data structures.
+  - Gates still run on full windows, not on a sample.
+  - The cache controller cannot choose "no cache", which is the best answer once block reads are sunk.
 - **The compaction gate has no shadow run.** A wrong compaction switch is caught only after the fact, by the post check over 4 windows.
 - **The block cache is process-wide** (one per process, set by the last `db:open`), counts blocks rather than bytes, and caches block strings, not parsed blocks.
 - **Not done** from the original list: a block hash index, adaptive bloom bits per level, and a control-plane API beyond the workspace defines.

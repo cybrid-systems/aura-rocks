@@ -1,0 +1,5 @@
+{"cfg":"lru","phase":"E1_hot_reads","ops":300,"ms":3539,"us_per_op":11796.666666666666,"cache_policy":"lru","bloom_reads":1,"cache_hits":276,"cache_misses":24,"hit_rate":0.92,"adapt_overhead_ms":0,"switches":0,"bad":0}
+{"cfg":"lru","phase":"E2_hot_scans","ops":300,"ms":51714,"us_per_op":172380.0,"cache_policy":"lru","bloom_reads":1,"cache_hits":358,"cache_misses":332,"hit_rate":0.518840579710145,"adapt_overhead_ms":0,"switches":0,"bad":0}
+{"cfg":"lru","phase":"E3_hot_moved","ops":300,"ms":3337,"us_per_op":11123.333333333334,"cache_policy":"lru","bloom_reads":1,"cache_hits":281,"cache_misses":19,"hit_rate":0.9366666666666666,"adapt_overhead_ms":0,"switches":0,"bad":0}
+{"cfg":"lru","phase":"E4_misses","ops":300,"ms":2205,"us_per_op":7350.0,"cache_policy":"lru","bloom_reads":1,"cache_hits":3,"cache_misses":4,"hit_rate":0.42857142857142855,"adapt_overhead_ms":0,"switches":0,"bad":0}
+{"cfg":"lru","phase":"total","ops":1200,"ms":61142,"us_per_op":50951.666666666664,"cache_policy":"lru","bloom_reads":1,"cache_hits":918,"cache_misses":379,"hit_rate":0.707787201233616,"adapt_overhead_ms":0,"switches":0,"bad":0}
