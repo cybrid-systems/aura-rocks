@@ -11,4 +11,9 @@ compaction=real      # L0+L1 -> L1 k-way merge (lib/merge.aura), overwritten + t
 manifest=real        # MANIFEST written to tmp + rename
 kernel_sink=real     # lib/rsink.aura + scripts/sink.aura: policy:sink! on rk-checksum, rk-hash, rk-bloom-probe, rk-dec, rk-block-seek with engine data; KEEP/ROLLBACK/SKIP JSONL
 hot_load=top-level   # (hot:load!) must be a top-level statement of the main program (aura#4546, aura#4547)
-gaps=no block cache; no snapshots/iterators over live writes; two levels; ASCII keys/values; merge step not sunk (primitive string<?); single-threaded
+memtable_reps=skiplist,vector,hash   # lib/mem.aura; chosen per rotation or live-migrated (rk-memtable-rep)
+compaction_styles=leveled,tiered     # sorted runs, MANIFEST v2; rk-compaction-style rk-l0-trigger rk-max-runs
+block_cache=lru,lfu,clock            # lib/cache.aura, block_cache_blocks (0 = off), live policy switch (rk-cache-policy); bloom_reads (rk-bloom-reads)
+adaptive=real        # lib/obs.aura + lib/adapt.aura: rule policy -> gate -> mutate:rebind -> post check -> rollback; JSONL trajectories -> aura-loop --adapt-ingest/--adapt-propose
+adaptive_result=switches work and are correct; adaptive loses overall to the best static config (37.0 vs 26.5 ms/op, cache 61.3 vs 52.6) because of Soft gate cost and EMA lag; docs/adaptive.md
+gaps=block cache process-wide and block-counted; controller gates in Soft are expensive; no compaction shadow gate; no snapshots/iterators over live writes; two levels; ASCII keys/values; merge step not sunk (primitive string<?); single-threaded

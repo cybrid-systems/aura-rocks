@@ -20,6 +20,8 @@ db:scan : merging iterator over memtable + every SSTable, newest wins, tombstone
 |---|---|
 | `lib/wal.aura` | Record = `"R" len(8) adler32(10) payload`. Appends use `O_APPEND` through `kernels/rocks_io.c` (optional fdatasync); there is a pure Aura fallback with `ROCKS_PURE_IO=1`. `db:open` replays the WAL and stops at the first torn or corrupt record. |
 | `lib/memtable.aura` | Skiplist on parallel growable vectors (max height 12, p=1/4). Overwrites in place; a tombstone is entry type `D`. |
+| `lib/mem.aura` | Memtable reps behind one interface: skiplist (`lib/memtable.aura`), vector, and hash + skiplist. |
+| `lib/obs.aura`, `lib/adapt.aura`, `lib/cache.aura` | Workload observer, structure-switching controller, and block cache (LRU/LFU/clock). |
 | `lib/entry.aura` | Entry = `type(1) klen(4) vlen(6) key value`. |
 | `lib/block.aura` | Data block = entries + restart offsets + count. Binary search runs in `rk-block-seek`. |
 | `lib/bloom.aura` | Bloom filter (`bloom_bits` per key, k = bpk·0.69, double hashing over `rk-hash`). |
@@ -58,6 +60,43 @@ The ranges cover the separate sink runs recorded so far. The speedup is measured
 
 Reads gain because the per-block checksum (21 ms in Soft) moves to C. Writes stay in Soft: the WAL and memtable are many small calls, each below the wrapper's break-even. For comparison, RocksDB does about 1 µs/op; this is a correctness-first engine on an interpreted face.
 
+## Adaptive structures
+
+Some of the engine's structures are chosen while it runs, from the observed workload, instead of being fixed at open time as in RocksDB:
+
+- the memtable rep: skiplist, vector, or hash + skiplist;
+- the compaction style (leveled or tiered) with its L0 trigger and max runs;
+- the block cache eviction policy (LRU, LFU or clock);
+- whether point reads consult the filters.
+
+How it works:
+
+- Each choice is a workspace define.
+- `lib/adapt.aura` hot-rebinds a define (`mutate:rebind`) only after a gate:
+  - memtable: a shadow replay that compares answers;
+  - cache: a simulation of every policy on the recent block accesses.
+- After a swap, it compares the measured wall time per op. It rolls the value back on a regression.
+- It logs every decision as a JSONL trajectory, which aura-loop ingests to propose thresholds (`--adapt-ingest`, `--adapt-propose` → `ADAPT_PROPOSAL`).
+
+Measured results, in ms/op ([docs/adaptive.md](docs/adaptive.md), 2 runs each):
+
+| workload | best static | adaptive |
+|---|---|---|
+| bench_adapt total (write seq → read → scan → write random) | 26.5 (hash:tiered) | 37.0 |
+| — write-seq phase | 22.4 (vector:tiered) | **17.2** |
+| — scan phase | 113.9 (skiplist:leveled) | **94.6** |
+| bench_cache total (hot reads → hot+scans → moved hot set → misses) | 52.6 (lru; no cache 62.7) | 61.3 |
+
+The switches work and are correctness-gated: the model tests run every rep × style, and every benchmark ends with 0 wrong answers. Adaptive wins the phases whose shape it detects (bulk sequential writes, scans).
+
+It does not yet win overall, for three reasons:
+
+- the controller's gates run in Soft, which costs about 3–9 ms/op;
+- a tiered → leveled switch costs a full merge;
+- the EMA lags behind phase changes.
+
+Details and the remaining gaps are in [docs/adaptive.md](docs/adaptive.md).
+
 ## Run
 
 ```sh
@@ -66,6 +105,8 @@ git clone --recursive https://github.com/cybrid-systems/aura-rocks && cd aura-ro
 export AURA_BIN=~/aura/build-rel/aura
 scripts/run_tests.sh                       # unit, sstable, db (randomized vs oracle, recovery, torn WAL), leaf rebind guard
 . scripts/env.sh && kernels/build_io.sh    # librocks_io.so (run_tests does this too)
+REPS=2 scripts/bench_adapt_all.sh          # static memtable rep x compaction style vs adaptive
+REPS=2 scripts/bench_cache_all.sh          # cache policies vs adaptive; tools/bench_table.py build/bench_*.jsonl
 BENCH_N=1000 $AURA_BIN scripts/bench.aura              # pure Aura
 BENCH_N=1000 BENCH_SINK=1 $AURA_BIN scripts/bench.aura # sink first, then the same workloads
 $AURA_BIN scripts/sink.aura                             # policy only (SINK_ONLY, SINK_MIN_SPEEDUP, SINK_MIN_SOFT_US)
@@ -86,11 +127,13 @@ Using it from Aura:
 - **aura#4547**: if the workspace is loaded while a module is loading, later `mutate:rebind`/heal makes module code call a different global, silently or with `invalid closure`. Repro: `probes/aura4547/`.
 - Workaround for both: `(hot:load!)` must run as a top-level statement of the main program. `db:open` refuses to run otherwise, and `tests/test_leaf.aura` checks that every rebind and heal reaches the right leaf.
 - **aura#4548**: `string-ref`/`substring` cost grows with the index even on ASCII strings. A random read on a 270 KB SSTable took more than 350 ms per get, until `sst:open` was changed to cut the file into per-block strings (the WAL is now cut per record too). Repro: `probes/string_ref_cost.aura`.
+- **aura#4549**: `sort`/`list-sort` silently return `()` for a list of strings and truncate floats. The memtable vector rep sorts with its own merge sort (`ru:sort-idx`). Repro: `probes/sort_nonint.aura`.
 - aura#4537 (list corruption after about 100 workspace calls) reproduced on 542fb9254 and is fixed on 89cbd6c2b. That is why the pin is 89cbd6c2b.
 
 ## Known gaps
 
-- No block cache: every get re-verifies the block checksum, so checksum speed dominates reads.
+- The block cache (`block_cache_blocks`, off by default) is process-wide, counts blocks rather than bytes, and caches block strings, not parsed blocks. Without it, every get re-verifies the block checksum.
+- The adaptive controller's gates cost more than the policy differences they win (see docs/adaptive.md).
 - No snapshots.
 - Two levels only (L0, L1).
 - ASCII-only keys and values.

@@ -81,6 +81,7 @@
 (adapt:set-param! ctl "cmp_periods" 1)
 (adapt:set-param! ctl "cache_every" 1)
 (adapt:set-param! ctl "max_regress" 100.0)
+(adapt:set-param! ctl "bloom_off_miss" 0.02)   ; default 0 never switches filters off
 (define seed 7)
 (define (rnd! m) (set! seed (modulo (+ (* seed 1103515245) 12345) 2147483648)) (modulo (quotient seed 65536) m))
 (define hot-ok #t)

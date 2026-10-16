@@ -69,7 +69,8 @@
         (cons "cmp_periods" 4)         ; observer windows a compaction / cache / bloom switch is judged over
         (cons "cache_min_gain" 1.1)    ; cache gate: simulated hits of the candidate / current policy
         (cons "cache_every" 2)         ; observer windows between cache policy evaluations
-        (cons "bloom_off_miss" 0.02)   ; point-read miss rate below: stop consulting filters
+        (cons "bloom_off_miss" 0.0)    ; point-read miss rate below: stop consulting filters (0: never;
+                                       ; measured at 0.02 the skipped checks saved less than they cost, docs/adaptive.md)
         (cons "bloom_on_miss" 0.05)))  ; miss rate at or above: consult filters again
 (define (adapt-load-proposal)
   (let ((p (getenv "ADAPT_PROPOSAL")))
