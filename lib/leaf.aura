@@ -7,7 +7,7 @@
 ; call a DIFFERENT define. Here they appear exactly in ws/hot.aura order, and
 ; tests/test_leaf.aura rebinds each leaf and checks every leaf:* follows it.
 (export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek
-        leaf:memtable-rep leaf:compaction-style leaf:l0-trigger leaf:max-runs)
+        leaf:memtable-rep leaf:compaction-style leaf:l0-trigger leaf:max-runs leaf:cache-policy leaf:bloom-reads)
 (require "hot" all:)
 
 (define (leaf:checksum s start end) (rk-checksum s start end))
@@ -20,3 +20,5 @@
 (define (leaf:compaction-style) (rk-compaction-style))
 (define (leaf:l0-trigger) (rk-l0-trigger))
 (define (leaf:max-runs) (rk-max-runs))
+(define (leaf:cache-policy) (rk-cache-policy))
+(define (leaf:bloom-reads) (rk-bloom-reads))

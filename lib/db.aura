@@ -23,7 +23,7 @@
 ; the next memtable is created at a flush) and "window" (observer window closed)
 ; obs: lib/obs.aura workload observer (every put/delete/get/scan is recorded)
 (export db:open db:put! db:delete! db:get db:scan db:flush! db:compact! db:close
-        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs db:mem-rep db:migrate-mem! db:set-hook! db:runs db:compaction-style)
+        db:options db:opt db:set-opt! db:stats db:level-files db:mem db:dir db:destroy! db:wal-path db:obs db:mem-rep db:migrate-mem! db:set-hook! db:runs db:compaction-style db:cache-policy db:bloom-reads? db:cache)
 (require "leaf" all:)
 (require "ru" all:)
 (require "rio" all:)
@@ -34,6 +34,7 @@
 (require "sst" all:)
 (require "merge" all:)
 (require "obs" all:)
+(require "cache" all:)
 
 ; ---- options: alist ("name" . value)
 (define (db:options)
@@ -48,7 +49,10 @@
         (cons "auto_compact" #t)
         (cons "obs_window" 200)           ; ops per observer window
         (cons "memtable_rep" #f)          ; "skiplist" "vector" "hash", or #f: ask the workspace (rk-memtable-rep)
-        (cons "prefix_len" 12)))          ; hash rep: bucket key prefix length
+        (cons "prefix_len" 12)            ; hash rep: bucket key prefix length
+        (cons "block_cache_blocks" 0)     ; verified-block cache capacity (blocks), 0 = no cache
+        (cons "cache_policy" #f)          ; "lru" "lfu" "clock" (#f: workspace rk-cache-policy)
+        (cons "bloom_reads" #f)))         ; 1/0: consult filters on point reads (#f: workspace rk-bloom-reads)
 (define (db-opt-in opts key)
   (cond ((null? opts) (ru:fail "unknown option " key)) ((equal? (car (car opts)) key) (cdr (car opts))) (else (db-opt-in (cdr opts) key))))
 (define (db-opt-set opts key v)
@@ -61,7 +65,15 @@
 ; after every op: a closed observer window is a decision point
 (define (db-after-op! db)
   (let ((o (vector-ref db 7)))
-    (if (obs:closed! o) (begin (obs:reset-closed! o) (db-hook! db "window")) #f)))
+    (if (obs:closed! o) (begin (obs:reset-closed! o) (db-sync-cache-policy! db) (db-hook! db "window")) #f)))
+; block cache (process-wide, lib/sst.aura) and its eviction policy
+(define (db:cache db) (sst:cache))
+(define (db:cache-policy db) (let ((r (db-opt-or db "cache_policy" #f))) (if r r (leaf:cache-policy))))
+(define (db-sync-cache-policy! db)
+  (let ((c (sst:cache))) (if c (cache:set-policy! c (db:cache-policy db)) #f)))
+(define (db:bloom-reads? db)
+  (and (> (db:opt db "bloom_bits") 0)
+       (let ((r (db-opt-or db "bloom_reads" #f))) (= 1 (if r r (leaf:bloom-reads))))))
 ; rep for the next memtable: the fixed option, else the workspace define the
 ; controller hot-swaps (lib/adapt.aura)
 (define (db:mem-rep db) (let ((r (db-opt-or db "memtable_rep" #f))) (if r r (leaf:memtable-rep))))
@@ -81,7 +93,11 @@
 (define (db:stats db)
   (let loop ((ns db-stat-names) (i 0) (acc (list)))
     (if (null? ns) (append (ru:rev acc) (list (cons "l0_files" (ru:len (db:level-files db 0))) (cons "l1_files" (ru:len (db:level-files db 1))) (cons "runs" (ru:len (db:runs db))) (cons "compaction_style" (db:compaction-style db))
-                                               (cons "mem_entries" (mem:count (vector-ref db 1))) (cons "mem_rep" (mem:rep (vector-ref db 1))) (cons "io" (rio:mode))) (sst:stats))
+                                               (cons "mem_entries" (mem:count (vector-ref db 1))) (cons "mem_rep" (mem:rep (vector-ref db 1))) (cons "io" (rio:mode))
+                                               (cons "cache_policy" (if (sst:cache) (cache:policy (sst:cache)) "none"))
+                                               (cons "cache_hits" (if (sst:cache) (cache:hits (sst:cache)) 0))
+                                               (cons "cache_misses" (if (sst:cache) (cache:misses (sst:cache)) 0))
+                                               (cons "bloom_reads" (if (db:bloom-reads? db) 1 0))) (sst:stats))
         (loop (cdr ns) (+ i 1) (cons (cons (car ns) (vector-ref (vector-ref db 6) i)) acc)))))
 
 (define (db:dir db) (vector-ref db 0))
@@ -138,6 +154,8 @@
          (db (vector dir #f 0 (car m) (vector (list) (list)) (if opts opts (db:options)) (make-vector (ru:len db-stat-names) 0) #f #f))
          (open-all (lambda (nums) (let loop ((ns nums) (acc (list))) (if (null? ns) (ru:rev acc) (loop (cdr ns) (cons (sst:open (db-file db (car ns) ".sst")) acc)))))))
     (vector-set! db 7 (obs:new (db-opt-or db "obs_window" 200)))
+    (let ((nb (db-opt-or db "block_cache_blocks" 0)))
+      (sst:set-cache! (if (> nb 0) (cache:new (db:cache-policy db) nb 512) #f)))
     (vector-set! db 1 (db-new-mem db))
     (vector-set! (vector-ref db 4) 0 (open-all (car (cdr (cdr m)))))
     (vector-set! (vector-ref db 4) 1 (map open-all (car (cdr (cdr (cdr m))))))
@@ -259,7 +277,7 @@
 (define (db-resolve hit) (if (and hit (= (car hit) entry:put)) (cdr hit) #f))
 ; -> #(value level probes): level "mem" "l0" "l1" or #f
 (define (db-get-full db key)
-  (let* ((x (mem:get (vector-ref db 1) key)) (use-bloom (> (db:opt db "bloom_bits") 0)))
+  (let* ((x (mem:get (vector-ref db 1) key)) (use-bloom (db:bloom-reads? db)))
     (if x
         (vector (db-resolve x) "mem" 0)
         (let l0 ((ts (db:level-files db 0)) (probes 0))

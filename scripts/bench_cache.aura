@@ -1,0 +1,80 @@
+; scripts/bench_cache.aura — block cache policies and filter reads under a
+; phase-shifting read workload: static policies vs the adaptive controller
+; (lib/adapt.aura knobs cache_policy + bloom_reads). One config per process.
+;
+; Load: N keys (sequential puts, flushed and fully compacted: one sorted run).
+;   E1 hot reads      E_N gets, 90% from a hot set of N/10 keys, 10% uniform
+;   E2 hot + scans    E_N ops: 50% hot get (same hot set), 50% scan of 40 entries
+;                     from a uniform start (one-touch blocks that pollute LRU)
+;   E3 hot set moved  E_N gets, 90% from a different hot set
+;   E4 misses         E_N gets of absent keys inside the key range
+;
+; Env: BENCH_CFG  "none" (no cache), "lru", "lfu", "clock" (static policy,
+;                 filters always consulted) or "adaptive"
+;      BENCH_SCALE (1.0), BENCH_CACHE_BLOCKS (12), BENCH_OUT (build/bench_cache.jsonl),
+;      ADAPT_TRAJ (build/adapt-traj-cache.jsonl), ADAPT_PROPOSAL
+(require "ru" all:)
+(require "rio" all:)
+(require "hot" all:)
+(require "db" all:)
+(require "adapt" all:)
+(hot:load!)   ; top-level statement: see lib/hot.aura
+
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define CFG (env-or "BENCH_CFG" "adaptive"))
+(define SCALE (string->number (env-or "BENCH_SCALE" "1.0")))
+(define (sz n) (exact (round (* n SCALE))))
+(define N (sz 1200)) (define E-N (sz 300))
+(define BLOCKS (string->number (env-or "BENCH_CACHE_BLOCKS" "12")))
+(define OUT (env-or "BENCH_OUT" (string-append (ru:root) "/build/bench_cache.jsonl")))
+(define TRAJ (env-or "ADAPT_TRAJ" (string-append (ru:root) "/build/adapt-traj-cache.jsonl")))
+(define DIR (string-append (ru:root) "/build/bench-cache-" (number->string (current-time-ms))))
+(define ADAPTIVE (equal? CFG "adaptive"))
+(define opts (list (cons "memtable_bytes" 16384) (cons "target_file_bytes" 65536) (cons "block_bytes" 4096) (cons "bloom_bits" 10)
+                   (cons "sync" #f) (cons "auto_compact" #t) (cons "obs_window" 100) (cons "prefix_len" 14)
+                   (cons "memtable_rep" "skiplist") (cons "compaction_style" "leveled") (cons "l0_trigger" 4) (cons "max_runs" 4)
+                   (cons "block_cache_blocks" (if (equal? CFG "none") 0 BLOCKS))
+                   (cons "cache_policy" (if (or ADAPTIVE (equal? CFG "none")) #f CFG))
+                   (cons "bloom_reads" (if ADAPTIVE #f 1))))
+(db:destroy! DIR)
+(define db (db:open DIR opts))
+(define (key i) (string-append "user" (ru:pad i 12)))
+(define (absent i) (string-append "user" (ru:pad i 12) "x"))
+(define value (list->string (let l ((k 0) (acc (list))) (if (< k 100) (l (+ k 1) (cons (integer->char (+ 97 (modulo (* k 7) 26))) acc)) acc))))
+(let loop ((i 0)) (if (< i N) (begin (db:put! db (key i) value) (loop (+ i 1))) #t))
+(db:flush! db)
+(db:compact! db)
+(define ctl (adapt:new TRAJ (list "cache_policy" "bloom_reads") #f))
+(if ADAPTIVE (adapt:attach! ctl db "bench-cache") #f)
+(define seed 99)
+(define (rnd! m) (set! seed (modulo (+ (* seed 1103515245) 12345) 2147483648)) (modulo (quotient seed 16) m))
+(define (stat name) (let loop ((s (db:stats db))) (cond ((null? s) #f) ((equal? (car (car s)) name) (cdr (car s))) (else (loop (cdr s))))))
+(define bad 0)
+(define (get-ok! i) (if (equal? (db:get db (key i)) value) #f (set! bad (+ bad 1))))
+(define HOT (quotient N 10))
+(define (hot-key base) (if (< (rnd! 10) 9) (+ base (rnd! HOT)) (rnd! N)))
+(define (report! phase ops ms h0 m0)
+  (let* ((h (- (stat "cache_hits") h0)) (m (- (stat "cache_misses") m0))
+         (row (list (cons "cfg" CFG) (cons "phase" phase) (cons "ops" ops) (cons "ms" ms) (cons "us_per_op" (/ (* 1000.0 ms) ops))
+                    (cons "cache_policy" (stat "cache_policy")) (cons "bloom_reads" (stat "bloom_reads"))
+                    (cons "cache_hits" h) (cons "cache_misses" m) (cons "hit_rate" (if (> (+ h m) 0) (/ (* 1.0 h) (+ h m)) 0.0))
+                    (cons "adapt_overhead_ms" (adapt:overhead-ms ctl)) (cons "switches" (ru:len (adapt:rows ctl))) (cons "bad" bad))))
+    (rio:append! OUT (string-append (adapt:json row) "\n") #f)
+    (display (string-append "  " phase " ")) (display ops) (display " ops ") (display ms) (display " ms ")
+    (display (/ (* 1000.0 ms) ops)) (display " us/op  policy=") (display (stat "cache_policy")) (display " bloom=") (display (stat "bloom_reads"))
+    (display " hit_rate=") (display (if (> (+ h m) 0) (/ (* 1.0 h) (+ h m)) 0.0)) (newline)))
+(define (now) (current-time-ms))
+(define (phase! name thunk)
+  (let ((t0 (now)) (h0 (stat "cache_hits")) (m0 (stat "cache_misses")))
+    (let loop ((n 0)) (if (< n E-N) (begin (thunk n) (loop (+ n 1))) #t))
+    (report! name E-N (- (now) t0) h0 m0)))
+(display (string-append "bench_cache cfg=" CFG " scale=" (number->string SCALE) " blocks=" (number->string BLOCKS))) (newline)
+(define T0 (now)) (define H0 (stat "cache_hits")) (define M0 (stat "cache_misses"))
+(phase! "E1_hot_reads" (lambda (n) (get-ok! (hot-key 0))))
+(phase! "E2_hot_scans" (lambda (n) (if (< (rnd! 2) 1) (get-ok! (hot-key 0)) (db:scan db (key (rnd! N)) #f 40))))
+(phase! "E3_hot_moved" (lambda (n) (get-ok! (hot-key (quotient N 2)))))
+(phase! "E4_misses" (lambda (n) (if (db:get db (absent (rnd! N))) (set! bad (+ bad 1)) #f)))
+(report! "total" (* 4 E-N) (- (now) T0) H0 M0)
+(if ADAPTIVE (begin (display "  switches: ") (display (adapt:summary ctl)) (newline)) #f)
+(display (list "wrong answers" bad)) (newline)
+(db:destroy! DIR)

@@ -77,6 +77,7 @@
 (set! db (db:open dir2 (opts2)))
 (define ctl3 (adapt:new traj (list "compaction") #f))
 (adapt:attach! ctl3 db "test-compaction")
+(adapt:set-param! ctl3 "collapse_on_leveled" 1)   ; the default (0) leaves the runs to the next compaction
 (define oracle2 (make-vector NK #f))
 (define (put2! i v) (db:put! db (key i) v) (vector-set! oracle2 i v))
 (let loop ((n 0)) (if (< n 500) (begin (put2! (rnd! NK) (string-append "c" (number->string n) "-payload-payload")) (loop (+ n 1))) #t))

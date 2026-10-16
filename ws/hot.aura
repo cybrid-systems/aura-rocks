@@ -72,3 +72,5 @@
 (define (rk-compaction-style) "leveled")
 (define (rk-l0-trigger) 4)
 (define (rk-max-runs) 4)
+(define (rk-cache-policy) "lru")
+(define (rk-bloom-reads) 1)

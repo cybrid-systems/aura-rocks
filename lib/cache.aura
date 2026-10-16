@@ -1,0 +1,112 @@
+; lib/cache.aura — block cache with a hot-switchable eviction policy.
+;
+; One fixed-capacity slot array; every policy's bookkeeping (recency stamp,
+; frequency, clock reference bit) is maintained on every access, so the
+; eviction policy can be switched live ("lru" | "lfu" | "clock") without
+; flushing or rebuilding the cache.  The policy only decides the victim.
+;
+; c = #(policy cap table keys vals stamps hist refs n hand tick hits misses ring ring-pos ring-n hist-n sfreq)
+;   sfreq: per-slot copy of the key's hist count (the LFU victim scan reads only this)
+;   hist:  native hash key -> access count, kept across evictions (an LFU
+;          with history, so a re-admitted hot block keeps its count); reset
+;          once it holds 16 x cap keys (aging)
+;   table: native hash key -> slot
+;   ring:  the last `ring-n` accessed keys (block access trace for the
+;          controller's shadow simulation)
+(export cache:new cache:get cache:put! cache:policy cache:set-policy! cache:cap cache:count
+        cache:hits cache:misses cache:reset-stats! cache:trace cache:simulate cache:policies cache:clear!)
+
+(define (cache:policies) (list "lru" "lfu" "clock"))
+
+(define (cache:new policy cap ring-n)
+  (vector policy cap (make-hash) (make-vector cap #f) (make-vector cap #f) (make-vector cap 0)
+          (make-hash) (make-vector cap 0) 0 0 0 0 0 (make-vector (if (> ring-n 0) ring-n 1) #f) 0 ring-n 0 (make-vector cap 0)))
+
+(define (cache:policy c) (vector-ref c 0))
+(define (cache:set-policy! c p) (vector-set! c 0 p))
+(define (cache:cap c) (vector-ref c 1))
+(define (cache:count c) (vector-ref c 8))
+(define (cache:hits c) (vector-ref c 11))
+(define (cache:misses c) (vector-ref c 12))
+(define (cache:reset-stats! c) (vector-set! c 11 0) (vector-set! c 12 0))
+(define (cache:clear! c)
+  (vector-set! c 2 (make-hash)) (vector-set! c 8 0) (vector-set! c 9 0)
+  (let loop ((i 0)) (if (< i (vector-ref c 1)) (begin (vector-set! (vector-ref c 3) i #f) (vector-set! (vector-ref c 4) i #f) (loop (+ i 1))) #t)))
+
+(define (cache-bump! c i) (vector-set! c i (+ 1 (vector-ref c i))))
+
+(define (cache-record! c key)
+  (if (> (vector-ref c 15) 0)
+      (let ((p (vector-ref c 14)))
+        (vector-set! (vector-ref c 13) (remainder p (vector-ref c 15)) key)
+        (vector-set! c 14 (+ p 1)))
+      #t))
+
+; access trace, oldest first
+(define (cache:trace c)
+  (let* ((rn (vector-ref c 15)) (p (vector-ref c 14)) (n (if (< p rn) p rn)) (ring (vector-ref c 13)))
+    (let loop ((i (- p 1)) (k 0) (acc (list)))
+      (if (>= k n) acc (loop (- i 1) (+ k 1) (cons (vector-ref ring (remainder i rn)) acc))))))
+
+(define (cache-touch! c s)
+  (cache-bump! c 10)
+  (vector-set! (vector-ref c 5) s (vector-ref c 10))
+  (vector-set! (vector-ref c 7) s 1))
+; count one access of key; returns its count
+(define (cache-count! c key)
+  (let* ((h (vector-ref c 6)) (f (hash-ref h key 0)))
+    (if (= f 0)
+        (if (>= (vector-ref c 16) (* 16 (vector-ref c 1)))
+            (let ((h2 (make-hash))) (vector-set! c 6 h2) (vector-set! c 16 1) (hash-set! h2 key 1) 1)
+            (begin (cache-bump! c 16) (hash-set! h key 1) 1))
+        (begin (hash-set! h key (+ f 1)) (+ f 1)))))
+(define (cache-freq c key) (hash-ref (vector-ref c 6) key 0))
+
+(define (cache:get c key)
+  (cache-record! c key)
+  (let ((f (cache-count! c key)) (s (hash-ref (vector-ref c 2) key -1)))
+    (if (< s 0) (begin (cache-bump! c 12) #f)
+        (begin (cache-bump! c 11) (cache-touch! c s) (vector-set! (vector-ref c 17) s f) (vector-ref (vector-ref c 4) s)))))
+
+; victim slot of a full cache
+(define (cache-victim c)
+  (let ((p (vector-ref c 0)) (cap (vector-ref c 1)) (st (vector-ref c 5)) (ks (vector-ref c 3)) (rf (vector-ref c 7)))
+    (cond
+      ((equal? p "clock")
+       (let loop ((h (vector-ref c 9)) (k 0))
+         (if (and (= (vector-ref rf h) 1) (< k (* 2 cap)))
+             (begin (vector-set! rf h 0) (loop (remainder (+ h 1) cap) (+ k 1)))
+             (begin (vector-set! c 9 (remainder (+ h 1) cap)) h))))
+      ((equal? p "lfu")
+       (let loop ((i 1) (best 0) (fb (vector-ref (vector-ref c 17) 0)))
+         (if (>= i cap) best
+             (let ((fi (vector-ref (vector-ref c 17) i)))
+               (if (or (< fi fb) (and (= fi fb) (< (vector-ref st i) (vector-ref st best))))
+                   (loop (+ i 1) i fi) (loop (+ i 1) best fb))))))
+      (else
+       (let loop ((i 1) (best 0))
+         (if (>= i cap) best
+             (loop (+ i 1) (if (< (vector-ref st i) (vector-ref st best)) i best))))))))
+
+(define (cache:put! c key val)
+  (if (<= (vector-ref c 1) 0) #f
+      (let ((s0 (hash-ref (vector-ref c 2) key -1)))
+        (if (>= s0 0) (begin (vector-set! (vector-ref c 4) s0 val) s0)
+            (let ((s (if (< (vector-ref c 8) (vector-ref c 1))
+                         (let ((n (vector-ref c 8))) (vector-set! c 8 (+ n 1)) n)
+                         (let ((v (cache-victim c)))
+                           (hash-remove! (vector-ref c 2) (vector-ref (vector-ref c 3) v)) v))))
+              (hash-set! (vector-ref c 2) key s)
+              (vector-set! (vector-ref c 3) s key)
+              (vector-set! (vector-ref c 4) s val)
+              (cache-touch! c s)
+              (vector-set! (vector-ref c 17) s (let ((f (cache-freq c key))) (if (> f 0) f 1)))
+              s)))))
+
+; hits of `policy` with capacity `cap` replaying `keys` (list) on a cold cache
+(define (cache:simulate policy cap keys)
+  (let ((c (cache:new policy cap 0)))
+    (let loop ((ks keys))
+      (if (null? ks) (cache:hits c)
+          (begin (if (not (cache:get c (car ks))) (cache:put! c (car ks) #t) #t)
+                 (loop (cdr ks)))))))

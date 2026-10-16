@@ -31,6 +31,8 @@
 (require "obs" all:)
 (require "mem" all:)
 (require "db" all:)
+(require "sst" all:)
+(require "cache" all:)
 
 ; ---- JSON
 (define (aj-str s)
@@ -59,11 +61,16 @@
         (cons "mem_min_speedup" 1.15)  ; shadow replay gate
         (cons "cmp_write_hi" 0.7)      ; write share at or above: tiered compaction
         (cons "cmp_read_hi" 0.5)       ; read+scan share at or above: leveled compaction
-        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 2) (cons "max_runs" 4)
+        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 4) (cons "max_runs" 4)
+        (cons "collapse_on_leveled" 0) ; 1: a switch tiered -> leveled merges all runs at once
         (cons "max_regress" 1.15)      ; post check: cost after / before above this -> rollback
         (cons "similar" 0.2)           ; post check only when the op mix moved less than this
         (cons "cooldown" 2)            ; decision points to wait after a rollback / reject
-        (cons "cmp_periods" 4)))       ; rotations a compaction switch is judged over
+        (cons "cmp_periods" 4)         ; observer windows a compaction / cache / bloom switch is judged over
+        (cons "cache_min_gain" 1.1)    ; cache gate: simulated hits of the candidate / current policy
+        (cons "cache_every" 2)         ; observer windows between cache policy evaluations
+        (cons "bloom_off_miss" 0.02)   ; point-read miss rate below: stop consulting filters
+        (cons "bloom_on_miss" 0.05)))  ; miss rate at or above: consult filters again
 (define (adapt-load-proposal)
   (let ((p (getenv "ADAPT_PROPOSAL")))
     (if (and (string? p) (> (string-length p) 0))
@@ -97,15 +104,18 @@
 ; knob -> workspace define and its current value
 (define (knob-define k)
   (cond ((equal? k "memtable_rep") "rk-memtable-rep") ((equal? k "compaction_style") "rk-compaction-style")
-        ((equal? k "l0_trigger") "rk-l0-trigger") ((equal? k "max_runs") "rk-max-runs") (else (ru:fail "adapt: unknown knob " k))))
+        ((equal? k "l0_trigger") "rk-l0-trigger") ((equal? k "max_runs") "rk-max-runs")
+        ((equal? k "cache_policy") "rk-cache-policy") ((equal? k "bloom_reads") "rk-bloom-reads") (else (ru:fail "adapt: unknown knob " k))))
 (define (adapt:knob k)
   (cond ((equal? k "memtable_rep") (leaf:memtable-rep)) ((equal? k "compaction_style") (leaf:compaction-style))
-        ((equal? k "l0_trigger") (leaf:l0-trigger)) ((equal? k "max_runs") (leaf:max-runs)) (else (ru:fail "adapt: unknown knob " k))))
+        ((equal? k "l0_trigger") (leaf:l0-trigger)) ((equal? k "max_runs") (leaf:max-runs))
+        ((equal? k "cache_policy") (leaf:cache-policy)) ((equal? k "bloom_reads") (leaf:bloom-reads)) (else (ru:fail "adapt: unknown knob " k))))
 (define (knob-body v) (if (string? v) (string-append "(lambda () \"" v "\")") (string-append "(lambda () " (number->string v) ")")))
 ; the hot swap itself
 (define (adapt:set-knob! k v)
   (mutate:rebind (knob-define k) (knob-body v) (string-append "aura-rocks adapt " k))
   (eval-current)
+  (if (and (equal? k "cache_policy") (sst:cache)) (cache:set-policy! (sst:cache) v) #f)
   (if (equal? (adapt:knob k) v) v (ru:fail "adapt: rebind of " k " did not take")))
 
 (define (feat fs k) (let loop ((fs fs)) (cond ((null? fs) 0.0) ((equal? (car (car fs)) k) (cdr (car fs))) (else (loop (cdr fs))))))
@@ -223,13 +233,16 @@
 (define (adapt:tick! ctl db event)
   (let ((fs (obs:features (db:obs db))))
     ; window events: live memtable switching, and compaction (a read phase has no flushes)
-    (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)) (not (knob-on? ctl "compaction")))) #f
+    (if (or (< (feat fs "ops") 100) (and (equal? event "window") (not (vector-ref ctl 7)) (not (knob-on? ctl "compaction"))
+                                          (not (knob-on? ctl "cache_policy")) (not (knob-on? ctl "bloom_reads")))) #f
         (begin
           (close-period! (vector-ref ctl (if (equal? event "rotate") 8 14)) db)
           (let ((t0 (current-time-ms)))
             (post-check! ctl db fs)
             (if (and (knob-on? ctl "memtable_rep") (or (equal? event "rotate") (vector-ref ctl 7))) (tick-mem! ctl db fs) #f)
             (if (knob-on? ctl "compaction") (tick-cmp! ctl db fs) #f)
+            (if (and (knob-on? ctl "cache_policy") (equal? event "window")) (tick-cache! ctl db fs) #f)
+            (if (and (knob-on? ctl "bloom_reads") (equal? event "window")) (tick-bloom! ctl db fs) #f)
             (let ((now (current-time-ms)))
               (vector-set! ctl 13 (+ (vector-ref ctl 13) (- now t0)))
               ; the tick's own time is moved out of both open periods
@@ -265,9 +278,51 @@
              (adapt:set-knob! "l0_trigger" trig)
              (adapt:set-knob! "max_runs" (ap ctl "max_runs"))
              (adapt-row! ctl "compaction_style" cur cand "SWAP" "policy" 1.0 fs (list (cons "l0_trigger_from" old-trig) (cons "l0_trigger_to" trig)))
-             ; leaving tiered: collapse the sorted runs once (read amp back to 1 run)
-             (if (equal? cand "leveled") (db:compact! db) #f)
+             ; leaving tiered: optionally collapse the sorted runs once (read amp back to 1 run)
+             ; (off by default: on a short read phase the one-off merge costs more
+             ; than the extra run probes it saves; the next L0 compaction merges anyway)
+             (if (and (equal? cand "leveled") (= 1 (ap ctl "collapse_on_leveled"))) (db:compact! db) #f)
              (add-pending! ctl "compaction_style" cur cand fs (list (cons "l0_trigger" old-trig)) (ap ctl "cmp_periods")))))))
+
+; block cache policy: shadow-simulate every policy on the recent block access
+; trace (same capacity) and switch live when the best beats the current one by
+; cache_min_gain; the post check then judges the measured cost per op
+(define (tick-cache! ctl db fs)
+  (let ((c (sst:cache)) (n (vector-ref (vector-ref ctl 14) 4)))
+    (cond ((not c) #f)
+          ((> (cool ctl "cache_policy") 0) (set-cool! ctl "cache_policy" (- (cool ctl "cache_policy") 1)))
+          ((pending? ctl "cache_policy") #f)
+          ((not (= 0 (remainder n (ap ctl "cache_every")))) #f)
+          (else
+           (let ((tr (cache:trace c)))
+             (if (< (ru:len tr) 128) #f
+                 (let* ((cur (adapt:knob "cache_policy"))
+                        (sims (map (lambda (p) (cons p (cache:simulate p (cache:cap c) tr))) (cache:policies)))
+                        (hc (cdr (assoc cur sims)))
+                        (best (let loop ((ss sims) (b (cons cur hc))) (cond ((null? ss) b) ((> (cdr (car ss)) (cdr b)) (loop (cdr ss) (car ss))) (else (loop (cdr ss) b)))))
+                        (gain (/ (* 1.0 (+ 1 (cdr best))) (+ 1 hc)))
+                        (extra (list (cons "sim_hits" sims) (cons "trace_len" (ru:len tr)) (cons "threshold" (ap ctl "cache_min_gain")))))
+                   (cond ((equal? (car best) cur) #f)
+                         ((< gain (ap ctl "cache_min_gain"))
+                          (set-cool! ctl "cache_policy" (ap ctl "cooldown"))
+                          (adapt-row! ctl "cache_policy" cur (car best) "REJECT" "gate" gain fs extra))
+                         (else
+                          (adapt:set-knob! "cache_policy" (car best))
+                          (adapt-row! ctl "cache_policy" cur (car best) "SWAP" "gate" gain fs extra)
+                          (add-pending! ctl "cache_policy" cur (car best) fs (list) (ap ctl "cmp_periods")))))))))))
+; filter reads: a filter check only pays when the key is absent
+(define (tick-bloom! ctl db fs)
+  (let* ((cur (adapt:knob "bloom_reads")) (miss (feat fs "miss_rate")) (reads (feat fs "read_ratio"))
+         (cand (cond ((and (= cur 1) (> reads 0.3) (< miss (ap ctl "bloom_off_miss"))) 0)
+                     ((and (= cur 0) (>= miss (ap ctl "bloom_on_miss"))) 1)
+                     (else cur))))
+    (cond ((> (cool ctl "bloom_reads") 0) (set-cool! ctl "bloom_reads" (- (cool ctl "bloom_reads") 1)))
+          ((pending? ctl "bloom_reads") #f)
+          ((= cand cur) #f)
+          (else
+           (adapt:set-knob! "bloom_reads" cand)
+           (adapt-row! ctl "bloom_reads" cur cand "SWAP" "policy" 1.0 fs (list (cons "miss_rate" miss)))
+           (add-pending! ctl "bloom_reads" cur cand fs (list) (ap ctl "cmp_periods"))))))
 
 ; install the controller as the db hook
 (define (adapt:attach! ctl db label)

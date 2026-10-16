@@ -12,17 +12,22 @@
 ; mmap) and verifies a data block's checksum each time it reads the block
 ; (no block cache in the MVP).
 ;
-; t  = #(path data idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size)
+; t  = #(path data idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size uid)
+;
+; Optional process-wide block cache (lib/cache.aura, sst:set-cache!): a
+; verified block is cached under "<uid>#<block>", uid unique per opened table,
+; so a cache hit skips the checksum.
 ; it = #(t bi block n ra ei)   (bi = nblocks: exhausted)
 (export sst:write sst:open sst:get sst:path sst:smallest sst:largest sst:count sst:size sst:nblocks
         sst:iter sst:iter-first! sst:iter-seek! sst:iter-valid? sst:iter-next! sst:iter-key sst:iter-type sst:iter-val
-        sst:block-bytes sst:stats sst:stats-reset!)
+        sst:block-bytes sst:stats sst:stats-reset! sst:set-cache! sst:cache)
 (require "leaf" all:)
 (require "ru" all:)
 (require "rio" all:)
 (require "entry" all:)
 (require "block" all:)
 (require "bloom" all:)
+(require "cache" all:)
 
 (define sst:block-bytes 4096)
 (define sst-footer-size 68)
@@ -33,6 +38,10 @@
 (define (sst:stats) (list (cons "bloom_checks" (vector-ref sst-counters 0)) (cons "bloom_negatives" (vector-ref sst-counters 1))
                           (cons "block_reads" (vector-ref sst-counters 2))))
 (define (sst:stats-reset!) (vector-set! sst-counters 0 0) (vector-set! sst-counters 1 0) (vector-set! sst-counters 2 0))
+(define sst-cache-box (vector #f 0))
+(define (sst:set-cache! c) (vector-set! sst-cache-box 0 c))
+(define (sst:cache) (vector-ref sst-cache-box 0))
+(define (sst-next-uid!) (let ((u (vector-ref sst-cache-box 1))) (vector-set! sst-cache-box 1 (+ u 1)) u))
 (define (sst-bump! i) (vector-set! sst-counters i (+ 1 (vector-ref sst-counters i))))
 
 (define (sst-sealed s) (string-append s (ru:pad (leaf:checksum s 0 (string-length s)) 10)))
@@ -100,7 +109,7 @@
                     (each (+ i 1) (+ q 24 kl)))
                   #t))
             (vector path raws keys offs sizes nb (bloom:parse (substring fl 0 (- flt-size 10)))
-                    smallest largest count n)))))))
+                    smallest largest count n (sst-next-uid!))))))))
 
 (define (sst:path t) (vector-ref t 0))
 (define (sst:nblocks t) (vector-ref t 5))
@@ -118,11 +127,18 @@
             (if (string<? (vector-ref keys m) key) (loop (+ m 1) hi) (loop lo m)))))))
 
 ; verified block content (without its checksum)
-(define (sst-block t i)
+(define (sst-block-read t i)
   (let ((raw (vector-ref (vector-ref t 1) i)))
     (sst-bump! 2)
     (sst-check-str! raw "block" (vector-ref t 0))
     (substring raw 0 (- (string-length raw) 10))))
+(define (sst-block t i)
+  (let ((c (vector-ref sst-cache-box 0)))
+    (if (not c) (sst-block-read t i)
+        (let* ((k (string-append (number->string (vector-ref t 11)) "#" (number->string i)))
+               (hit (cache:get c k)))
+          (if hit hit
+              (let ((b (sst-block-read t i))) (cache:put! c k b) b))))))
 
 ; #f, or (type . val) for key
 (define (sst:get t key use-bloom)
