@@ -38,13 +38,25 @@ All on-disk data is 7-bit ASCII. Aura strings are UTF-8, so a char ≥ 128 is 2 
 
 | leaf | decision | measured speedup | Soft cost per call |
 |---|---|---|---|
-| rk-checksum | KEEP | 54–203× | 21–23 ms (4 KB block) |
-| rk-block-seek | KEEP | 2.2–5.3× | 0.85–0.95 ms |
+| rk-checksum | KEEP | 52–203× | 21–23 ms (4 KB block) |
+| rk-block-seek | KEEP | 2.1–5.3× | 0.85–0.95 ms |
 | rk-hash | ROLLBACK (too-slow) | 0.33–0.76× | 0.1–0.15 ms |
-| rk-bloom-probe | ROLLBACK (too-slow) | 0.30–0.69× | 0.15 ms |
-| rk-dec | ROLLBACK / SKIP | 0.26× | 0.04–0.09 ms |
+| rk-bloom-probe | ROLLBACK (too-slow) | 0.29–0.69× | 0.12–0.15 ms |
+| rk-dec | ROLLBACK / SKIP (too-cheap) | 0.26–0.27× | 0.04–0.09 ms |
 
-The ranges cover the separate sink runs recorded so far. Benchmarks with numbers are in [docs/bench.md](docs/bench.md).
+The ranges cover the separate sink runs recorded so far. The speedup is measured through the wrapper on a single call, so a larger Soft cost per call gives a larger speedup.
+
+### Benchmark (N=2000, 100-byte values, 4 flushes + 1 compaction per fill; [docs/bench.md](docs/bench.md))
+
+| workload | pure Aura µs/op | with sink µs/op | speedup |
+|---|---|---|---|
+| fillseq | 10774 | 11231 | 0.96× |
+| fillrandom | 11417 | 11730 | 0.97× |
+| readrandom | 24556 | 6873 | 3.57× |
+| readseq (scan) | 6267 | 5515 | 1.14× |
+| readmissing | 4458 | 4431 | 1.01× |
+
+Reads gain because the per-block checksum (21 ms in Soft) moves to C. Writes stay in Soft: the WAL and memtable are many small calls, each below the wrapper's break-even. For comparison, RocksDB does about 1 µs/op; this is a correctness-first engine on an interpreted face.
 
 ## Run
 
@@ -73,6 +85,7 @@ Using it from Aura:
 - **aura#4546**: `(define x (f))` is silently left unbound when `f` runs `set-code` + `eval-current` of a source with a letrec loop. Repro: `probes/aura4546.aura`.
 - **aura#4547**: if the workspace is loaded while a module is loading, later `mutate:rebind`/heal makes module code call a different global, silently or with `invalid closure`. Repro: `probes/aura4547/`.
 - Workaround for both: `(hot:load!)` must run as a top-level statement of the main program. `db:open` refuses to run otherwise, and `tests/test_leaf.aura` checks that every rebind and heal reaches the right leaf.
+- **aura#4548**: `string-ref`/`substring` cost grows with the index even on ASCII strings. A random read on a 270 KB SSTable took more than 350 ms per get, until `sst:open` was changed to cut the file into per-block strings (the WAL is now cut per record too). Repro: `probes/string_ref_cost.aura`.
 - aura#4537 (list corruption after about 100 workspace calls) reproduced on 542fb9254 and is fixed on 89cbd6c2b. That is why the pin is 89cbd6c2b.
 
 ## Known gaps
