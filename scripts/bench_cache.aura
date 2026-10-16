@@ -18,7 +18,11 @@
 (require "hot" all:)
 (require "db" all:)
 (require "adapt" all:)
+(require "rsink" all:)
 (hot:load!)   ; top-level statement: see lib/hot.aura
+; BENCH_SINK=1: every leaf runs its C kernel (lib/rsink.aura install-all,
+; kernels/rocks_leaves.c; setup, not timed); rows carry "sink": 1
+(define SINKN (if (equal? (getenv "BENCH_SINK") "1") (length (rsink:install-all!)) 0))
 
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 (define CFG (env-or "BENCH_CFG" "adaptive"))
@@ -55,7 +59,7 @@
 (define (hot-key base) (if (< (rnd! 10) 9) (+ base (rnd! HOT)) (rnd! N)))
 (define (report! phase ops ms h0 m0)
   (let* ((h (- (stat "cache_hits") h0)) (m (- (stat "cache_misses") m0))
-         (row (list (cons "cfg" CFG) (cons "phase" phase) (cons "ops" ops) (cons "ms" ms) (cons "us_per_op" (/ (* 1000.0 ms) ops))
+         (row (list (cons "cfg" CFG) (cons "sink" (if (> SINKN 0) 1 0)) (cons "phase" phase) (cons "ops" ops) (cons "ms" ms) (cons "us_per_op" (/ (* 1000.0 ms) ops))
                     (cons "cache_policy" (stat "cache_policy")) (cons "bloom_reads" (stat "bloom_reads"))
                     (cons "cache_hits" h) (cons "cache_misses" m) (cons "hit_rate" (if (> (+ h m) 0) (/ (* 1.0 h) (+ h m)) 0.0))
                     (cons "adapt_overhead_ms" (adapt:overhead-ms ctl)) (cons "switches" (ru:len (adapt:rows ctl))) (cons "bad" bad))))

@@ -49,6 +49,17 @@
 ; entries: list of (type key val), strictly increasing keys, non-empty.
 ; Returns (path count size smallest largest).
 (define (sst:write path entries block-bytes bits-per-key)
+  ; one coarse kernel (ws/hot.aura rk-sst-build) when its slot is installed
+  (let ((data (leaf:sst-build-k (let loop ((es entries) (acc (list)))
+                                  (if (null? es) (ru:concat (ru:rev acc))
+                                      (loop (cdr es) (cons (entry:encode (car (car es)) (car (cdr (car es))) (car (cdr (cdr (car es))))) acc))))
+                                block-bytes bits-per-key)))
+    (if data
+        (begin (rio:write path data)
+               (list path (ru:len entries) (string-length data) (car (cdr (car entries)))
+                     (let last ((es entries)) (if (null? (cdr es)) (car (cdr (car es))) (last (cdr es))))))
+        (sst-write-soft path entries block-bytes bits-per-key))))
+(define (sst-write-soft path entries block-bytes bits-per-key)
   (let loop ((es entries) (cur (list)) (cur-bytes 0) (last-key "") (off 0) (pieces (list)) (index (list)) (keys (list)) (count 0) (kb (list)))
     (if (or (null? es) (>= cur-bytes block-bytes))
         ; flush the current block (if any)

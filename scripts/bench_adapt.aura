@@ -16,7 +16,11 @@
 (require "db" all:)
 (require "obs" all:)
 (require "adapt" all:)
+(require "rsink" all:)
 (hot:load!)   ; top-level statement: see lib/hot.aura
+; BENCH_SINK=1: every leaf runs its C kernel (lib/rsink.aura install-all,
+; kernels/rocks_leaves.c; setup, not timed); rows carry "sink": 1
+(define SINKN (if (equal? (getenv "BENCH_SINK") "1") (length (rsink:install-all!)) 0))
 
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 (define CFG (env-or "BENCH_CFG" "adaptive"))
@@ -46,7 +50,7 @@
 (define (stat name) (let loop ((s (db:stats db))) (cond ((null? s) #f) ((equal? (car (car s)) name) (cdr (car s))) (else (loop (cdr s))))))
 (define found 0)
 (define (report! phase ops ms)
-  (let* ((row (list (cons "cfg" CFG) (cons "phase" phase) (cons "ops" ops) (cons "ms" ms) (cons "us_per_op" (/ (* 1000.0 ms) ops))
+  (let* ((row (list (cons "cfg" CFG) (cons "sink" (if (> SINKN 0) 1 0)) (cons "phase" phase) (cons "ops" ops) (cons "ms" ms) (cons "us_per_op" (/ (* 1000.0 ms) ops))
                     (cons "mem_rep" (stat "mem_rep")) (cons "compaction_style" (stat "compaction_style")) (cons "runs" (stat "runs"))
                     (cons "l0_files" (stat "l0_files")) (cons "flushes" (stat "flushes")) (cons "compactions" (stat "compactions"))
                     (cons "compaction_ms" (stat "compaction_ms")) (cons "sst_bytes_written" (stat "sst_bytes_written"))

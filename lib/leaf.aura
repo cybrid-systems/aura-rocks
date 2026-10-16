@@ -8,6 +8,7 @@
 ; tests/test_leaf.aura rebinds each leaf and checks every leaf:* follows it.
 (export leaf:checksum leaf:hash leaf:bloom-probe leaf:dec leaf:block-seek
         leaf:pad leaf:entry-encode leaf:wal-record leaf:block-build leaf:bloom-build leaf:bloom-may leaf:block-get leaf:cache-sim
+        leaf:sst-build leaf:sst-build-k leaf:sst-merge leaf:sst-merge-k
         leaf:memtable-rep leaf:compaction-style leaf:l0-trigger leaf:max-runs leaf:cache-policy leaf:bloom-reads
         leaf:install! leaf:installed leaf:uninstall-all!)
 (require "hot" all:)
@@ -74,6 +75,24 @@
       (let ((r (leaf-k-cache-sim policy cap trace (string-length trace)))) (if (exact? r) r (rk-cache-sim policy cap trace)))
       (rk-cache-sim policy cap trace)))
 
+; whole-table kernels: the -k form answers the kernel's String or #f (no slot /
+; refused) so the engine keeps its own module path; the plain form falls back
+; to the workspace define (the specification).
+(define leaf-k-sst-build #f)
+(define (leaf:sst-build-k blob bb bpk)
+  (if (and leaf-k-sst-build (string? blob))
+      (let ((r (leaf-k-sst-build blob (string-length blob) bb bpk))) (if (string? r) r #f))
+      #f))
+(define (leaf:sst-build blob bb bpk)
+  (let ((r (leaf:sst-build-k blob bb bpk))) (if r r (rk-sst-build blob bb bpk))))
+(define leaf-k-sst-merge #f)
+(define (leaf:sst-merge-k files bottom target bb bpk)
+  (if (and leaf-k-sst-merge (string? files))
+      (let ((r (leaf-k-sst-merge files (string-length files) bottom target bb bpk))) (if (string? r) r #f))
+      #f))
+(define (leaf:sst-merge files bottom target bb bpk)
+  (let ((r (leaf:sst-merge-k files bottom target bb bpk))) (if r r (rk-sst-merge files bottom target bb bpk))))
+
 (define (leaf:memtable-rep) (rk-memtable-rep))
 (define (leaf:compaction-style) (rk-compaction-style))
 (define (leaf:l0-trigger) (rk-l0-trigger))
@@ -99,9 +118,11 @@
         ((equal? name "rk-bloom-may") (set! leaf-k-bloom-may k) #t)
         ((equal? name "rk-block-get") (set! leaf-k-block-get k) #t)
         ((equal? name "rk-cache-sim") (set! leaf-k-cache-sim k) #t)
+        ((equal? name "rk-sst-build") (set! leaf-k-sst-build k) #t)
+        ((equal? name "rk-sst-merge") (set! leaf-k-sst-merge k) #t)
         (else #f)))
 ; names whose slot holds a kernel
 (define (leaf:installed)
-  (let loop ((xs (list (cons "rk-checksum" leaf-k-checksum) (cons "rk-hash" leaf-k-hash) (cons "rk-dec" leaf-k-dec) (cons "rk-block-seek" leaf-k-block-seek) (cons "rk-pad" leaf-k-pad) (cons "rk-entry-encode" leaf-k-entry-encode) (cons "rk-wal-record" leaf-k-wal-record) (cons "rk-block-build" leaf-k-block-build) (cons "rk-bloom-build" leaf-k-bloom-build) (cons "rk-bloom-may" leaf-k-bloom-may) (cons "rk-block-get" leaf-k-block-get) (cons "rk-cache-sim" leaf-k-cache-sim))) (acc (list)))
+  (let loop ((xs (list (cons "rk-checksum" leaf-k-checksum) (cons "rk-hash" leaf-k-hash) (cons "rk-dec" leaf-k-dec) (cons "rk-block-seek" leaf-k-block-seek) (cons "rk-pad" leaf-k-pad) (cons "rk-entry-encode" leaf-k-entry-encode) (cons "rk-wal-record" leaf-k-wal-record) (cons "rk-block-build" leaf-k-block-build) (cons "rk-bloom-build" leaf-k-bloom-build) (cons "rk-bloom-may" leaf-k-bloom-may) (cons "rk-block-get" leaf-k-block-get) (cons "rk-cache-sim" leaf-k-cache-sim) (cons "rk-sst-build" leaf-k-sst-build) (cons "rk-sst-merge" leaf-k-sst-merge))) (acc (list)))
     (cond ((null? xs) (reverse acc)) ((cdr (car xs)) (loop (cdr xs) (cons (car (car xs)) acc))) (else (loop (cdr xs) acc)))))
 (define (leaf:uninstall-all!) (for-each (lambda (n) (leaf:install! n #f)) (leaf:installed)) #t)

@@ -339,3 +339,221 @@ AURA_SINK_EXPORT long rk_block_seek(const char *b, long bl, const char *key, lon
   }
   return lo;
 }
+
+/* ---- whole tables: build one SST (flush) and merge SSTs (compaction) ----
+ * Same bytes as lib/sst.aura sst:write / lib/db.aura db-merge-run!. */
+typedef struct { char *p; size_t n, cap; int bad; } Buf;
+static void bput(Buf *b, const char *s, size_t n) {
+  if (b->bad) return;
+  if (b->n + n + 1 > b->cap) {
+    size_t c = b->cap ? b->cap : 65536;
+    while (c < b->n + n + 1) c *= 2;
+    char *q = realloc(b->p, c);
+    if (!q) { b->bad = 1; return; }
+    b->p = q; b->cap = c;
+  }
+  memcpy(b->p + b->n, s, n); b->n += n;
+}
+static void bdec(Buf *b, uint64_t v, int w) {
+  char t[24];
+  if (!fits(v, w)) { b->bad = 1; return; }
+  put_dec(t, v, w); bput(b, t, (size_t)w);
+}
+static void bseal(Buf *b, size_t from) { /* append adler(p[from..n)) as 10 digits */
+  if (b->bad) return;
+  bdec(b, adler(b->p + from, (long)(b->n - from)), 10);
+}
+typedef struct { const char *e; long el; } Ent; /* one encoded entry type klen vlen key val */
+#define EKL(x) dec((x) + 1, 4)
+#define EVL(x) dec((x) + 5, 6)
+
+/* append one SST built from ents[0..n) (strictly increasing keys) to out */
+static int sst_build_into(Buf *out, const Ent *es, long n, long bb, long bpk) {
+  if (n <= 0 || bpk < 0 || bpk > 1000) return 0;
+  size_t base = out->n;
+  Buf idx = {0}; long nblocks = 0;
+  long i = 0;
+  while (i < n) {
+    size_t bstart = out->n; long cur = 0, j = i;
+    while (j < n && (j == i || cur < bb)) { cur += es[j].el + 6; j++; }
+    /* block: entries, offsets(6), count(6) */
+    long off = 0;
+    for (long q = i; q < j; q++) bput(out, es[q].e, (size_t)es[q].el);
+    for (long q = i; q < j; q++) { bdec(out, (uint64_t)off, 6); off += es[q].el; }
+    bdec(out, (uint64_t)(j - i), 6);
+    bseal(out, bstart);
+    const char *lk = es[j - 1].e + 11; long lkl = EKL(es[j - 1].e);
+    bdec(&idx, (uint64_t)lkl, 4); bput(&idx, lk, (size_t)lkl);
+    bdec(&idx, (uint64_t)(bstart - base), 12); bdec(&idx, (uint64_t)(out->n - bstart), 8);
+    nblocks++; i = j;
+  }
+  long data_end = (long)(out->n - base);
+  /* index */
+  size_t istart = out->n;
+  const char *sk = es[0].e + 11; long skl = EKL(es[0].e);
+  const char *lk = es[n - 1].e + 11; long lkl = EKL(es[n - 1].e);
+  bdec(out, (uint64_t)skl, 4); bput(out, sk, (size_t)skl);
+  bdec(out, (uint64_t)lkl, 4); bput(out, lk, (size_t)lkl);
+  bdec(out, (uint64_t)nblocks, 8);
+  if (idx.bad) { free(idx.p); return 0; }
+  bput(out, idx.p, idx.n); free(idx.p);
+  bseal(out, istart);
+  long idx_size = (long)(out->n - istart);
+  /* filter over every key */
+  size_t fstart = out->n;
+  long nbits = n * bpk; if (nbits < 64) nbits = 64;
+  long nchars = (nbits + 5) / 6;
+  long k = bpk * 69 / 100; if (k > 30) k = 30; if (k < 1) k = 1;
+  bdec(out, (uint64_t)nbits, 10); bdec(out, (uint64_t)k, 2);
+  unsigned char *v = calloc((size_t)nchars + 1, 1);
+  if (!v) return 0;
+  for (long q = 0; q < n; q++) {
+    uint64_t h = rk_hash(es[q].e + 11, EKL(es[q].e), 0);
+    uint64_t p = h % (uint64_t)nbits, d = h / 131072 + (h % 131072) * 32768;
+    for (long r = 0; r < k; r++) { v[p / 6] |= (unsigned char)(1u << (p % 6)); p = (p + d) % (uint64_t)nbits; }
+  }
+  for (long q = 0; q < nchars; q++) v[q] = (unsigned char)(v[q] + 48);
+  bput(out, (const char *)v, (size_t)nchars); free(v);
+  bseal(out, fstart);
+  long flt_size = (long)(out->n - fstart);
+  bdec(out, (uint64_t)data_end, 12); bdec(out, (uint64_t)idx_size, 12);
+  bdec(out, (uint64_t)(data_end + idx_size), 12); bdec(out, (uint64_t)flt_size, 12);
+  bdec(out, (uint64_t)n, 12); bput(out, "AROCKS01", 8);
+  return !out->bad;
+}
+
+/* parse encoded entries back to back */
+static Ent *split_ents(const char *b, long bl, long *np) {
+  long cap = 256, n = 0; Ent *es = malloc(sizeof(Ent) * (size_t)cap);
+  if (!es) return NULL;
+  for (long off = 0; off < bl; n++) {
+    if (off + 11 > bl || !digits(b + off + 1, 10) || (b[off] != 'P' && b[off] != 'D')) { free(es); return NULL; }
+    long sz = 11 + dec(b + off + 1, 4) + dec(b + off + 5, 6);
+    if (off + sz > bl) { free(es); return NULL; }
+    if (n == cap) { cap *= 2; Ent *q = realloc(es, sizeof(Ent) * (size_t)cap); if (!q) { free(es); return NULL; } es = q; }
+    es[n].e = b + off; es[n].el = sz; off += sz;
+  }
+  *np = n; return es;
+}
+static int key_cmp(const Ent *a, const Ent *b) {
+  long al = EKL(a->e), bl = EKL(b->e);
+  int c = memcmp(a->e + 11, b->e + 11, (size_t)(al < bl ? al : bl));
+  if (c) return c;
+  return al < bl ? -1 : (al > bl ? 1 : 0);
+}
+
+/* rk-sst-build (blob bb bpk) -> SST file bytes from the encoded entries in blob */
+AURA_SINK_EXPORT const char *rk_sst_build(const char *b, long bl, long bb, long bpk) {
+  if (!ascii_ok(b, bl) || bb < 1) return NULL;
+  long n = 0; Ent *es = split_ents(b, bl, &n);
+  if (!es) return NULL;
+  for (long i = 1; i < n; i++) if (key_cmp(&es[i - 1], &es[i]) >= 0) { free(es); return NULL; }
+  Buf out = {0};
+  int ok = sst_build_into(&out, es, n, bb, bpk);
+  free(es);
+  if (!ok) { free(out.p); return NULL; }
+  char *o = rbuf(out.n);
+  if (!o) { free(out.p); return NULL; }
+  memcpy(o, out.p, out.n); o[out.n] = 0; free(out.p);
+  return o;
+}
+
+/* entries of one SST (data in memory), block checksums verified */
+static Ent *sst_entries(const char *d, long dl, long *np) {
+  if (dl < 68 || memcmp(d + dl - 8, "AROCKS01", 8) != 0 || !digits(d + dl - 68, 60)) return NULL;
+  const char *ft = d + dl - 68;
+  long io = dec(ft, 12), is = dec(ft + 12, 12);
+  if (io < 0 || is < 10 || io + is > dl) return NULL;
+  const char *ix = d + io; long il = is - 10;
+  if (!digits(ix + il, 10) || (uint64_t)dec(ix + il, 10) != adler(ix, il)) return NULL;
+  long q = 0;
+  if (il < 4) return NULL;
+  long sl = dec(ix, 4); q = 4 + sl; if (q + 4 > il) return NULL;
+  long ll = dec(ix + q, 4); q += 4 + ll; if (q + 8 > il) return NULL;
+  long nb = dec(ix + q, 8); q += 8;
+  long cap = 256, n = 0; Ent *es = malloc(sizeof(Ent) * (size_t)cap);
+  if (!es) return NULL;
+  for (long bi = 0; bi < nb; bi++) {
+    if (q + 4 > il) goto bad;
+    long kl = dec(ix + q, 4);
+    if (q + 24 + kl > il) goto bad;
+    long off = dec(ix + q + 4 + kl, 12), size = dec(ix + q + 16 + kl, 8);
+    q += 24 + kl;
+    if (off < 0 || size < 16 || off + size > io) goto bad;
+    const char *blk = d + off; long bl = size - 10;
+    if (!digits(blk + bl, 10) || (uint64_t)dec(blk + bl, 10) != adler(blk, bl)) goto bad;
+    if (!digits(blk + bl - 6, 6)) goto bad;
+    long cnt = dec(blk + bl - 6, 6), ra = bl - 6 - 6 * cnt;
+    if (ra < 0) goto bad;
+    for (long e = 0; e < cnt; e++) {
+      if (!digits(blk + ra + 6 * e, 6)) goto bad;
+      long eo = dec(blk + ra + 6 * e, 6);
+      if (eo + 11 > ra || !digits(blk + eo + 1, 10)) goto bad;
+      long sz = 11 + dec(blk + eo + 1, 4) + dec(blk + eo + 5, 6);
+      if (eo + sz > ra) goto bad;
+      if (n == cap) { cap *= 2; Ent *t = realloc(es, sizeof(Ent) * (size_t)cap); if (!t) goto bad; es = t; }
+      es[n].e = blk + eo; es[n].el = sz; n++;
+    }
+  }
+  *np = n; return es;
+bad:
+  free(es); return NULL;
+}
+
+/* rk-sst-merge (files bottommost target bb bpk): files = { len(12) SST bytes }*
+ * newest first. k-way merge (newest wins per key), bottommost drops
+ * tombstones, a new output once the current one holds >= target bytes
+ * (17 + klen + vlen per entry). Result: { len(12) SST bytes }*. */
+AURA_SINK_EXPORT const char *rk_sst_merge(const char *b, long bl, long bottom, long target, long bb, long bpk) {
+  if (!ascii_ok(b, bl) || bb < 1) return NULL;
+  long nf = 0, cap = 8; Ent **fe = malloc(sizeof(Ent *) * (size_t)cap); long *fn = malloc(sizeof(long) * (size_t)cap);
+  const char *res = NULL;
+  Ent *outv = NULL; Buf out = {0};
+  if (!fe || !fn) goto done;
+  for (long off = 0; off < bl;) {
+    if (off + 12 > bl || !digits(b + off, 12)) goto done;
+    long len = dec(b + off, 12);
+    if (off + 12 + len > bl) goto done;
+    if (nf == cap) { cap *= 2; fe = realloc(fe, sizeof(Ent *) * (size_t)cap); fn = realloc(fn, sizeof(long) * (size_t)cap); if (!fe || !fn) goto done; }
+    fe[nf] = sst_entries(b + off + 12, len, &fn[nf]);
+    if (!fe[nf]) goto done;
+    nf++; off += 12 + len;
+  }
+  long total = 0; for (long i = 0; i < nf; i++) total += fn[i];
+  outv = malloc(sizeof(Ent) * (size_t)(total + 1));
+  long *pos = calloc((size_t)nf + 1, sizeof(long));
+  if (!outv || !pos) { free(pos); goto done; }
+  long on = 0, cur = 0, first = 0;
+  for (;;) {
+    long best = -1;
+    for (long i = 0; i < nf; i++)
+      if (pos[i] < fn[i] && (best < 0 || key_cmp(&fe[i][pos[i]], &fe[best][pos[best]]) < 0)) best = i;
+    if (best < 0) break;
+    Ent e = fe[best][pos[best]];
+    for (long i = 0; i < nf; i++)
+      if (pos[i] < fn[i] && key_cmp(&fe[i][pos[i]], &e) == 0) pos[i]++;
+    if (bottom && e.e[0] == 'D') continue;
+    if (on > first && cur >= target) {
+      size_t at = out.n; bput(&out, "000000000000", 12);
+      if (!sst_build_into(&out, outv + first, on - first, bb, bpk)) { free(pos); goto done; }
+      put_dec(out.p + at, (uint64_t)(out.n - at - 12), 12);
+      first = on; cur = 0;
+    }
+    outv[on++] = e; cur += 17 + EKL(e.e) + EVL(e.e);
+  }
+  if (on > first) {
+    size_t at = out.n; bput(&out, "000000000000", 12);
+    if (!sst_build_into(&out, outv + first, on - first, bb, bpk)) { free(pos); goto done; }
+    put_dec(out.p + at, (uint64_t)(out.n - at - 12), 12);
+  }
+  free(pos);
+  if (out.bad) goto done;
+  {
+    char *o = rbuf(out.n + 1);
+    if (o) { if (out.n) memcpy(o, out.p, out.n); o[out.n] = 0; res = o; }
+  }
+done:
+  if (fe) for (long i = 0; i < nf; i++) free(fe[i]);
+  free(fe); free(fn); free(outv); free(out.p);
+  return res;
+}

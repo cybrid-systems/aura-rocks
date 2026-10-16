@@ -24,12 +24,14 @@
 
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 (define OUT (env-or "PROFILE_OUT" (string-append (ru:root) "/build/profile.jsonl")))
-(define TAG (env-or "PROFILE_TAG" (if (equal? (env-or "PROFILE_SINK" "0") "1") "sink" "soft")))
+(define TAG (env-or "PROFILE_TAG" (if (equal? (env-or "PROFILE_SINK" "0") "0") "soft" "sink")))
 (define plant (plant:real))
 (score:set-rounds! 3)
 (if (equal? (env-or "PROFILE_SINK" "0") "1")
     (rsink:sink-all! plant (rsink:samples) #f (string->number (env-or "SINK_MIN_SOFT_US" "50")) #f (string-append (ru:root) "/build/trajectory-profile.jsonl"))
     #f)
+; PROFILE_SINK=all: every kernel installed (rsink:install-all!), no policy
+(if (equal? (env-or "PROFILE_SINK" "0") "all") (rsink:install-all!) #f)
 
 (define (prof name reps thunk)
   (let ((t0 (current-time-ms)))
@@ -72,7 +74,7 @@
     (prof (string-append "mem:entries " rep " (flush view)") 3 (lambda (i) (mem:entries m)))))
 (mem-put-prof "skiplist") (mem-put-prof "vector") (mem-put-prof "hash")
 ; ---- db
-(define dir (string-append (ru:root) "/build/profile-db"))
+(define dir (string-append (ru:root) "/build/profile-db-" TAG))   ; per tag: parallel runs do not share a DB
 (db:destroy! dir)
 (define db (db:open dir (list (cons "memtable_bytes" 65536) (cons "l0_trigger" 4) (cons "target_file_bytes" 262144) (cons "block_bytes" 4096)
                               (cons "bloom_bits" 10) (cons "sync" #f) (cons "auto_compact" #t) (cons "obs_window" 200))))

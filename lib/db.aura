@@ -220,6 +220,27 @@
     (sst:open (car meta))))
 ; merge inputs (newest first) into one sorted run of files; bottommost: drop tombstones
 (define (db-merge-run! db inputs bottommost)
+  (let ((r (db-merge-run-k db inputs bottommost))) (if r (car r) (db-merge-run-soft! db inputs bottommost))))
+; one coarse kernel (ws/hot.aura rk-sst-merge) over the input files' bytes;
+; #f when the slot is empty or the kernel refused (corruption included: the
+; module path then reports it)
+(define (db-merge-run-k db inputs bottommost)
+  (let* ((files (let loop ((ts inputs) (acc (list)))
+                  (if (null? ts) (ru:concat (ru:rev acc))
+                      (let ((d (rio:read (sst:path (car ts))))) (if d (loop (cdr ts) (cons d (cons (ru:pad (string-length d) 12) acc))) #f)))))
+         (blob (and files (leaf:sst-merge-k files (if bottommost 1 0) (db:opt db "target_file_bytes") (db:opt db "block_bytes") (db:opt db "bloom_bits")))))
+    (if (not blob) #f
+        (begin
+          (db-bump! db "compaction_bytes_in" (db-sum-sizes inputs))
+          (let loop ((off 0) (outs (list)))
+            (if (>= off (string-length blob)) (list (ru:rev outs))
+                (let* ((n (leaf:dec blob off 12)) (data (substring blob (+ off 12) (+ off 12 n)))
+                       (path (db-file db (db-new-file-num! db) ".sst")))
+                  (rio:write path data)
+                  (db-bump! db "compaction_bytes_out" n)
+                  (db-bump! db "sst_bytes_written" n)
+                  (loop (+ off 12 n) (cons (sst:open path) outs)))))))))
+(define (db-merge-run-soft! db inputs bottommost)
   (let ((mg (merge:first! (merge:new (let loop ((ts inputs) (acc (list))) (if (null? ts) (ru:rev acc) (loop (cdr ts) (cons (merge:sst-source (car ts)) acc)))))))
         (target (db:opt db "target_file_bytes")))
     (db-bump! db "compaction_bytes_in" (db-sum-sizes inputs))
