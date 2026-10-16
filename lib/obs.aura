@@ -1,0 +1,113 @@
+; lib/obs.aura — workload observer: rolling counters over op windows.
+;
+; Every db op is recorded (obs:put! obs:get! obs:scan!). After `window` ops
+; the window closes: its ratios are blended into the features
+; (feature = a * window + (1 - a) * feature, a = 0.6), the window resets. The
+; controller (lib/adapt.aura) reads obs:features; the bench and the trajectory
+; rows log them as the state.
+;
+; Features (all numbers):
+;   ops            ops seen in total
+;   read_ratio     gets / ops            write_ratio  (puts + deletes) / ops
+;   scan_share     scans / ops           seq_ratio    puts whose key > previous put key
+;   miss_rate      gets that found nothing (or a tombstone) / gets
+;   hit_mem hit_l0 hit_l1   share of gets answered by memtable / L0 / L1+
+;   read_amp       SST files probed per get
+;   scan_len       entries returned per scan
+;   put_us get_us scan_us   mean wall time per op of each kind (window)
+;   write_amp      SST bytes written (flush + compaction) / user bytes (lifetime)
+;
+; A ring of the last 256 ops (kind + key) is kept for shadow replays.
+(export obs:new obs:put! obs:get! obs:scan! obs:features obs:feature obs:windows obs:trace
+        obs:note-sst-bytes! obs:closed! obs:reset-closed! obs:window-size)
+(require "ru" all:)
+
+; window counter slots
+(define c-puts 0) (define c-dels 1) (define c-gets 2) (define c-scans 3) (define c-seq 4) (define c-miss 5)
+(define c-hmem 6) (define c-hl0 7) (define c-hl1 8) (define c-probes 9) (define c-put-ms 10) (define c-get-ms 11)
+(define c-scan-ms 12) (define c-scan-n 13)
+(define c-n 14)
+(define feat-names (list "read_ratio" "write_ratio" "scan_share" "seq_ratio" "miss_rate" "hit_mem" "hit_l0" "hit_l1"
+                         "read_amp" "scan_len" "put_us" "get_us" "scan_us"))
+(define trace-n 256)
+; o = #(win feats last-put-key window nwin ops trace-kinds trace-keys trace-pos user-bytes sst-bytes closed)
+(define (obs:new window)
+  (vector (make-vector c-n 0) (make-vector (ru:len feat-names) #f) "" window 0 0
+          (make-vector trace-n -1) (make-vector trace-n "") 0 0 0 #f))
+(define (obs:window-size o) (vector-ref o 3))
+(define (obs:windows o) (vector-ref o 4))
+(define (obs-bump! o i n) (let ((w (vector-ref o 0))) (vector-set! w i (+ (vector-ref w i) n))))
+(define (obs-trace! o kind key)
+  (let ((p (vector-ref o 8)))
+    (vector-set! (vector-ref o 6) p kind) (vector-set! (vector-ref o 7) p key)
+    (vector-set! o 8 (modulo (+ p 1) trace-n))))
+; the ring, oldest first, as a list of (kind . key); kind 0 put 1 delete 2 get 3 scan
+(define (obs:trace o)
+  (let loop ((k 0) (acc (list)))
+    (if (>= k trace-n) (ru:rev acc)
+        (let* ((i (modulo (+ (vector-ref o 8) k) trace-n)) (kind (vector-ref (vector-ref o 6) i)))
+          (loop (+ k 1) (if (< kind 0) acc (cons (cons kind (vector-ref (vector-ref o 7) i)) acc)))))))
+
+(define (obs-ratio a b) (if (> b 0) (/ (* 1.0 a) b) 0.0))
+(define (obs-close! o)
+  (let* ((w (vector-ref o 0)) (f (vector-ref o 1))
+         (puts (+ (vector-ref w c-puts) (vector-ref w c-dels))) (gets (vector-ref w c-gets)) (scans (vector-ref w c-scans))
+         (ops (+ puts gets scans))
+         (win (list (obs-ratio gets ops) (obs-ratio puts ops) (obs-ratio scans ops)
+                    (obs-ratio (vector-ref w c-seq) (vector-ref w c-puts)) (obs-ratio (vector-ref w c-miss) gets)
+                    (obs-ratio (vector-ref w c-hmem) gets) (obs-ratio (vector-ref w c-hl0) gets) (obs-ratio (vector-ref w c-hl1) gets)
+                    (obs-ratio (vector-ref w c-probes) gets) (obs-ratio (vector-ref w c-scan-n) scans)
+                    (obs-ratio (* 1000 (vector-ref w c-put-ms)) puts) (obs-ratio (* 1000 (vector-ref w c-get-ms)) gets)
+                    (obs-ratio (* 1000 (vector-ref w c-scan-ms)) scans)))
+         ; a feature moves only when its denominator occurred in the window
+         (dens (list ops ops ops (vector-ref w c-puts) gets gets gets gets gets scans puts gets scans))
+         )
+    (let loop ((i 0) (xs win) (ds dens))
+      (if (null? xs) #t
+          (begin
+            (if (= (car ds) 0) #f
+                (vector-set! f i (if (vector-ref f i) (+ (* 0.6 (car xs)) (* 0.4 (vector-ref f i))) (car xs))))
+            (loop (+ i 1) (cdr xs) (cdr ds)))))
+    (vector-set! o 0 (make-vector c-n 0))
+    (vector-set! o 4 (+ (vector-ref o 4) 1))
+    (vector-set! o 11 #t)))
+(define (obs-op! o)
+  (vector-set! o 5 (+ (vector-ref o 5) 1))
+  (let* ((w (vector-ref o 0)) (n (+ (vector-ref w c-puts) (vector-ref w c-dels) (vector-ref w c-gets) (vector-ref w c-scans))))
+    (if (>= n (vector-ref o 3)) (obs-close! o) #f)))
+; set when a window closed since the last obs:reset-closed! (controller hook)
+(define (obs:closed! o) (vector-ref o 11))
+(define (obs:reset-closed! o) (vector-set! o 11 #f))
+
+(define (obs:put! o key del? bytes ms)
+  (obs-bump! o (if del? c-dels c-puts) 1)
+  (if (and (not del?) (string<? (vector-ref o 2) key)) (obs-bump! o c-seq 1) #f)
+  (if del? #f (vector-set! o 2 key))
+  (vector-set! o 9 (+ (vector-ref o 9) bytes))
+  (obs-bump! o c-put-ms ms)
+  (obs-trace! o (if del? 1 0) key)
+  (obs-op! o))
+; level: "mem" "l0" "l1" or #f (miss); probes: SST files consulted
+(define (obs:get! o key level found? probes ms)
+  (obs-bump! o c-gets 1)
+  (if found? #f (obs-bump! o c-miss 1))
+  (cond ((equal? level "mem") (obs-bump! o c-hmem 1)) ((equal? level "l0") (obs-bump! o c-hl0 1))
+        ((equal? level "l1") (obs-bump! o c-hl1 1)) (else #f))
+  (obs-bump! o c-probes probes)
+  (obs-bump! o c-get-ms ms)
+  (obs-trace! o 2 key)
+  (obs-op! o))
+(define (obs:scan! o start n ms)
+  (obs-bump! o c-scans 1) (obs-bump! o c-scan-n n) (obs-bump! o c-scan-ms ms)
+  (obs-trace! o 3 start)
+  (obs-op! o))
+(define (obs:note-sst-bytes! o n) (vector-set! o 10 (+ (vector-ref o 10) n)))
+
+(define (obs:features o)
+  (let loop ((ns feat-names) (i 0) (acc (list)))
+    (if (null? ns)
+        (append (list (cons "ops" (vector-ref o 5))) (ru:rev acc)
+                (list (cons "write_amp" (obs-ratio (vector-ref o 10) (vector-ref o 9)))))
+        (loop (cdr ns) (+ i 1) (cons (cons (car ns) (let ((v (vector-ref (vector-ref o 1) i))) (if v v 0.0))) acc)))))
+(define (obs:feature o name)
+  (let loop ((fs (obs:features o))) (cond ((null? fs) (ru:fail "unknown feature " name)) ((equal? (car (car fs)) name) (cdr (car fs))) (else (loop (cdr fs))))))

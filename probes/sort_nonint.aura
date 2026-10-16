@@ -1,0 +1,5 @@
+(require "std/list" all:)
+(display (sort (list "b" "a" "c"))) (newline)
+(display (sort (list 2.5 1.7 3.9))) (newline)
+(display (list-sort (list "b" "a" "c"))) (newline)
+(display (list-sort (list 2.5 1.7 3.9))) (newline)
