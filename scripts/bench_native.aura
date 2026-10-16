@@ -1,0 +1,112 @@
+; scripts/bench_native.aura — the db_bench-style workloads of scripts/bench.aura
+; on the native data plane (lib/ndb.aura -> native/rk_native.c), three ways:
+;
+;   BENCH_MODE=op      Aura harness, ONE native call per op (key built in Aura,
+;                      then ndb:put! / ndb:get; readseq = ndb:scan, chunks of 256)
+;   BENCH_MODE=batch   Aura harness, one native call per BENCH_BATCH ops
+;                      (ndb:write! of puts, ndb:multi-get of keys; keys built in Aura)
+;   BENCH_MODE=engine  the native workload driver (rkn_bench): keys, values and
+;                      the loop in C, like db_bench; measures the engine alone
+;
+; Same workloads, sizes and options as scripts/bench.aura: fresh DB per fill,
+; fillrandom = every key once in random order, flush before the reads,
+; readrandom / readseq / readmissing on the fillrandom DB. Options: native
+; defaults = db:options (64 KB memtable, L0 trigger 4, 256 KB files, 4 KB
+; blocks, 10 bloom bits, WAL on without fsync, SSTs fdatasync'd, no block cache).
+; Env: BENCH_N, BENCH_VALUE, BENCH_MODE, BENCH_BATCH (100), BENCH_DIR,
+;      BENCH_OUT, BENCH_TAG, BENCH_OPTS ("k=v;..." extra native options).
+(require "ru" all:)
+(require "rio" all:)
+(require "ndb" all:)
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define N (string->number (env-or "BENCH_N" "2000")))
+(define VLEN (string->number (env-or "BENCH_VALUE" "100")))
+(define MODE (env-or "BENCH_MODE" "op"))
+(define B (string->number (env-or "BENCH_BATCH" "100")))
+(define DIR (env-or "BENCH_DIR" (string-append (ru:root) "/build/bench-native-db")))
+(define OUT (env-or "BENCH_OUT" (string-append (ru:root) "/build/bench.jsonl")))
+(define TAG (env-or "BENCH_TAG" (string-append "native-" MODE)))
+(define OPTS (env-or "BENCH_OPTS" ""))
+(define (key i) (string-append "user" (substring (number->string (+ 1000000000000 i)) 1 13)))
+(define value (list->string (let loop ((k 0) (acc (list))) (if (< k VLEN) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (* k 7) 26))) acc)) acc))))
+(define seed 301)
+(define (rnd! m) (set! seed (modulo (+ (* seed 1103515245) 12345) 2147483648)) (modulo (quotient seed 16) m))
+(define (perm n)
+  (let ((v (make-vector n 0)))
+    (let fill ((i 0)) (if (< i n) (begin (vector-set! v i i) (fill (+ i 1))) #t))
+    (let shuf ((i (- n 1)))
+      (if (> i 0) (let* ((j (rnd! (+ i 1))) (t (vector-ref v i))) (vector-set! v i (vector-ref v j)) (vector-set! v j t) (shuf (- i 1))) v))))
+(define results (list))
+(define (report! name ops us-total extra)
+  (let ((us (if (> ops 0) (/ us-total ops) 0.0)))
+    (display (string-append "  " name " ")) (display ops) (display " ops: ") (display us) (display " us/op") (display extra) (newline)
+    (set! results (cons (list name ops (/ us-total 1000.0) us (if (> us 0) (/ 1000000.0 us) 0.0)) results))))
+(define (now) (current-time-ms))
+(define (ms->us ms) (* 1000.0 ms))
+(define (stat d k) (cdr (assoc k (ndb:stats d))))
+(define (fresh!) (ndb:destroy! DIR) (ndb:open DIR OPTS))
+
+(display (string-append "aura-rocks native bench (" TAG "): N=" (number->string N) " value=" (number->string VLEN) " mode=" MODE)) (newline)
+(define d #f)
+(define (engine! op) (let ((r (ndb:bench d (string-append "op=" op ";n=" (number->string N) ";value=" (number->string VLEN) ";seed=301"))))
+                       (cons (/ (cdr (assoc "ns" r)) 1000.0) (cdr (assoc "found" r)))))
+; puts of keys (index list / vector) in batches of B
+(define (put-batched! idx-of n)
+  (let loop ((i 0))
+    (if (< i n)
+        (let ((hi (ru:min n (+ i B))))
+          (ndb:write! d (let mk ((j (- hi 1)) (acc (list))) (if (< j i) acc (mk (- j 1) (cons (list "put" (key (idx-of j)) value) acc)))))
+          (loop hi))
+        #t)))
+(define (get-batched! keyf n)
+  (let loop ((i 0) (found 0))
+    (if (< i n)
+        (let* ((hi (ru:min n (+ i B)))
+               (ks (let mk ((j i) (acc (list))) (if (>= j hi) (ru:rev acc) (mk (+ j 1) (cons (keyf j) acc)))))
+               (vs (ndb:multi-get d ks)))
+          (loop hi (+ found (let c ((vs vs) (n 0)) (if (null? vs) n (c (cdr vs) (if (car vs) (+ n 1) n)))))))
+        found)))
+
+; fillseq
+(set! d (fresh!))
+(cond ((equal? MODE "engine") (report! "fillseq" N (car (engine! "fillseq")) ""))
+      (else (let ((t0 (now)))
+              (if (equal? MODE "batch") (put-batched! (lambda (j) j) N)
+                  (let loop ((i 0)) (if (< i N) (begin (ndb:put! d (key i) value) (loop (+ i 1))) #t)))
+              (report! "fillseq" N (ms->us (- (now) t0)) ""))))
+(ndb:close d)
+; fillrandom
+(set! d (fresh!))
+(define order (perm N))
+(cond ((equal? MODE "engine") (report! "fillrandom" N (car (engine! "fillrandom")) ""))
+      (else (let ((t0 (now)))
+              (if (equal? MODE "batch") (put-batched! (lambda (j) (vector-ref order j)) N)
+                  (let loop ((i 0)) (if (< i N) (begin (ndb:put! d (key (vector-ref order i)) value) (loop (+ i 1))) #t)))
+              (report! "fillrandom" N (ms->us (- (now) t0)) ""))))
+(ndb:flush! d)
+(display "  after fill: ") (display (list (cons "flushes" (stat d "flushes")) (cons "compactions" (stat d "compactions")) (cons "l0" (stat d "l0_files")) (cons "l1" (stat d "l1_files")) (cons "runs" (stat d "runs")))) (newline)
+; readrandom
+(cond ((equal? MODE "engine") (let ((r (engine! "readrandom"))) (report! "readrandom" N (car r) (string-append " (" (number->string (cdr r)) " found)"))))
+      ((equal? MODE "batch") (let* ((t0 (now)) (f (get-batched! (lambda (j) (key (rnd! N))) N))) (report! "readrandom" N (ms->us (- (now) t0)) (string-append " (" (number->string f) " found)"))))
+      (else (let ((t0 (now)) (found 0))
+              (let loop ((i 0)) (if (< i N) (begin (if (ndb:get d (key (rnd! N))) (set! found (+ found 1)) #f) (loop (+ i 1))) #t))
+              (report! "readrandom" N (ms->us (- (now) t0)) (string-append " (" (number->string found) " found)")))))
+; readseq (per entry)
+(cond ((equal? MODE "engine") (let ((r (engine! "readseq"))) (report! "readseq" (cdr r) (car r) "")))
+      (else (let* ((t0 (now)) (n (ru:len (ndb:scan d "" #f #f)))) (report! "readseq" n (ms->us (- (now) t0)) ""))))
+; readmissing
+(define bn0 (stat d "bloom_negatives"))
+(cond ((equal? MODE "engine") (report! "readmissing" N (car (engine! "readmissing")) ""))
+      ((equal? MODE "batch") (let ((t0 (now))) (get-batched! (lambda (j) (string-append (key (rnd! N)) "x")) N) (report! "readmissing" N (ms->us (- (now) t0)) "")))
+      (else (let ((t0 (now)))
+              (let loop ((i 0)) (if (< i N) (begin (ndb:get d (string-append (key (rnd! N)) "x")) (loop (+ i 1))) #t))
+              (report! "readmissing" N (ms->us (- (now) t0)) ""))))
+(display "  bloom negatives: ") (display (- (stat d "bloom_negatives") bn0)) (newline)
+(ndb:close d)
+(define (jrow r) (string-append "{\"tag\":\"" TAG "\",\"bench\":\"" (car r) "\",\"n\":" (number->string N) ",\"value\":" (number->string VLEN)
+                                ",\"ops\":" (number->string (car (cdr r))) ",\"ms\":" (number->string (car (cdr (cdr r))))
+                                ",\"us_per_op\":" (number->string (car (cdr (cdr (cdr r))))) ",\"ops_per_s\":" (number->string (car (cdr (cdr (cdr (cdr r))))))
+                                ",\"mode\":\"" MODE "\",\"batch\":" (number->string B) "}\n"))
+(rio:init!)
+(let loop ((rs (ru:rev results))) (if (null? rs) #t (begin (rio:append! OUT (jrow (car rs)) #f) (loop (cdr rs)))))
+(display (string-append "results appended to " OUT)) (newline)

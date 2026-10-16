@@ -46,7 +46,9 @@
 (define (kept) (if (not (null? kept-only)) kept-only (kept-rows)))
 (define (kept-rows) (let loop ((rs sink-rows) (acc (list))) (if (null? rs) (ru:rev acc) (loop (cdr rs) (if (equal? (policy:get (car rs) "decision") "KEEP") (cons (policy:get (car rs) "name") acc) acc)))))
 
-(define (key i) (string-append "user" (ru:pad i 12)))
+; "user" + 12 digits; built with 3 primitives (ru:pad loops in Aura and cost
+; ~0.25 ms per key, more than a whole native op): same strings as before
+(define (key i) (string-append "user" (substring (number->string (+ 1000000000000 i)) 1 13)))
 (define value (list->string (let loop ((k 0) (acc (list))) (if (< k VLEN) (loop (+ k 1) (cons (integer->char (+ 97 (modulo (* k 7) 26))) acc)) acc))))
 (define seed 301)
 (define (rnd! m) (set! seed (modulo (+ (* seed 1103515245) 12345) 2147483648)) (modulo (quotient seed 16) m))

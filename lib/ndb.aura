@@ -1,0 +1,178 @@
+; lib/ndb.aura — the native data plane (native/rk_native.c), driven from Aura.
+;
+; Every put / get / delete / batch / multiget is ONE native call, a scan is
+; one call per chunk. Memtable, WAL, SSTs, block cache, compaction and the
+; stats counters all live in C behind an opaque handle (aura-kernel-sink
+; lib/nmod.aura). Aura holds the options and decides (lib/nctl.aura); the
+; pure-Aura engine (lib/db.aura) stays the reference oracle and the fallback.
+;
+; ndb = #(module handle dir optstring fns) — module can be swapped (nctl:swap-impl!);
+; fns: the module's c-funcs in ndb:spec order, so a put is vector-ref + one call
+; Options: an alist like db:options (only the keys given are sent; the native
+; defaults match db:options: 64 KB memtable, L0 trigger 4, 256 KB files, 4 KB
+; blocks, 10 bloom bits, WAL without fsync, no block cache), or a "k=v;..." string.
+; Keys and values: byte strings without NUL, key 1..9999 bytes, value < 1 MB.
+(export ndb:deps ndb:module ndb:load-module ndb:spec ndb:source ndb:open ndb:close ndb:destroy! ndb:put! ndb:delete! ndb:get
+        ndb:write! ndb:multi-get ndb:scan ndb:flush! ndb:compact! ndb:set! ndb:stats ndb:stat ndb:check ndb:bench
+        ndb:sample ndb:sample-v ndb:mark! ndb:sim-start! ndb:sim-poll ndb:handle ndb:mod ndb:dir ndb:optstring ndb:opts->string ndb:reattach! ndb:live ndb:version)
+(require "ru" all:)
+(require "nmod" all:)
+
+(define ndb:spec
+  (list (list "version" "rkn_version" (list) "I") (list "open" "rkn_open" (list "S" "I") "I")
+        (list "close" "rkn_close" (list "I") "I") (list "destroy" "rkn_destroy" (list "S") "I")
+        (list "put" "rkn_put" (list "I" "S" "I") "I") (list "del" "rkn_del" (list "I" "S") "I")
+        (list "get" "rkn_get" (list "I" "S") "S") (list "write" "rkn_write" (list "I" "S") "I")
+        (list "mget" "rkn_mget" (list "I" "S") "S") (list "iter" "rkn_iter" (list "I" "S" "I") "I")
+        (list "iter-next" "rkn_iter_next" (list "I" "I") "S") (list "iter-close" "rkn_iter_close" (list "I") "I")
+        (list "flush" "rkn_flush" (list "I") "I") (list "compact" "rkn_compact" (list "I") "I")
+        (list "set" "rkn_set" (list "I" "S") "I") (list "stat" "rkn_stat" (list "I" "S") "I")
+        (list "stats" "rkn_stats" (list "I") "S") (list "check" "rkn_check" (list "I") "I")
+        (list "bench" "rkn_bench" (list "I" "S") "S") (list "live" "rkn_live" (list) "I")
+        (list "error" "rkn_last_error" (list) "S")
+        ; control-plane kernels (native/rkn_ctl.h)
+        (list "sample" "rkn_sample" (list "I" "I" "I") "S") (list "sim-start" "rkn_sim_start" (list "I" "I" "I") "I")
+        (list "sim-poll" "rkn_sim_poll" (list "I") "S") (list "sample-v" "rkn_sample_v" (list "I" "I" "I") "S")))
+(define (ndb:source) (string-append (ru:root) "/native/rk_native.c"))
+(define (ndb:deps) (map (lambda (f) (string-append (ru:root) "/native/" f)) (list "rkn_util.h" "rkn_mem.h" "rkn_sst.h" "rkn_ctl.h")))
+; build (content-addressed) + load one implementation; cflags select the version/variant
+(define (ndb:load-module tag cflags)
+  (nmod:load (nmod:build! (ndb:source) tag cflags (ndb:deps)) ndb:spec))
+(define nd-default #f)
+(define (ndb:module)
+  (if nd-default nd-default
+      (let ((m (ndb:load-module "rkn" "-DRKN_IMPL_VERSION=1")))
+        (if m (begin (set! nd-default m) m) (ru:fail "ndb: native data plane failed to build/load (see build/kernels/libnmod_rkn_*.so.log)")))))
+
+(define (ndb:mod d) (vector-ref d 0))
+(define (ndb:handle d) (vector-ref d 1))
+(define (ndb:dir d) (vector-ref d 2))
+(define (ndb:optstring d) (vector-ref d 3))
+(define (ndb:version d) ((nmod:fn (ndb:mod d) "version")))
+(define (nd-fv m) (list->vector (map (lambda (s) (nmod:fn m (car s))) ndb:spec)))
+(define (nd-f d name)
+  (let loop ((sp ndb:spec) (i 0)) (if (equal? (car (car sp)) name) (vector-ref (vector-ref d 4) i) (loop (cdr sp) (+ i 1)))))
+(define (nd-err m) (let ((e ((nmod:fn m "error")))) (if (string? e) e "?")))
+(define (nd-check d rc what) (if (< rc 0) (ru:fail "ndb " what ": " (nd-err (vector-ref d 0))) rc))
+
+(define (nd-val v) (cond ((equal? v #t) "1") ((equal? v #f) "0") ((number? v) (number->string v)) (else v)))
+(define (ndb:opts->string opts)
+  (cond ((not opts) "") ((string? opts) opts)
+        (else (let loop ((xs opts) (acc (list)))
+                (if (null? xs) (ru:concat (ru:rev acc))
+                    (let ((k (car (car xs))) (v (cdr (car xs))))
+                      ; Aura-only options (observer, workspace fallbacks) have no native meaning
+                      (if (or (not v) (equal? k "obs_window") (equal? k "engine"))
+                          (loop (cdr xs) acc)
+                          (loop (cdr xs) (cons (string-append k "=" (nd-val v) ";") acc)))))))))
+
+(define (ndb:open dir opts . mod)
+  (let* ((m (if (null? mod) (ndb:module) (car mod)))
+         (os (ndb:opts->string opts))
+         (spec (string-append dir os))
+         (h ((nmod:fn m "open") spec (string-length spec) (string-length dir))))
+    (if (< h 0) (ru:fail "ndb:open " dir ": " (nd-err m)) (vector m h dir os (nd-fv m)))))
+(define (ndb:close d) (nd-check d ((nd-f d "close") (vector-ref d 1)) "close") #t)
+; point a record at another module + handle (after a swap)
+(define (ndb:reattach! d m h) (vector-set! d 0 m) (vector-set! d 1 h) (vector-set! d 4 (nd-fv m)) d)
+(define (ndb:destroy! dir) ((nmod:fn (ndb:module) "destroy") dir (string-length dir)) #t)
+(define (ndb:live) ((nmod:fn (ndb:module) "live")))
+
+; hot path: one vector-ref + one native call (spec index 4 put, 5 del, 6 get)
+; one String per native call (aura#4554): key + value packed, key length as an Int
+(define (ndb:put! d k v) (let ((kv (string-append k v))) (if (< ((vector-ref (vector-ref d 4) 4) (vector-ref d 1) kv (string-length kv) (string-length k)) 0) (nd-check d -1 "put") #t)))
+(define (ndb:delete! d k) (if (< ((vector-ref (vector-ref d 4) 5) (vector-ref d 1) k (string-length k)) 0) (nd-check d -1 "delete") #t))
+; value or #f
+(define (ndb:get d k)
+  (let ((r ((vector-ref (vector-ref d 4) 6) (vector-ref d 1) k (string-length k))))
+    (cond ((not (string? r)) #f)
+          ((equal? (string-ref r 0) 43) (substring r 1 (string-length r)))   ; "+"
+          (else (ru:fail "ndb:get: " (substring r 1 (string-length r)))))))
+
+; ops: list of ("put" k v) / ("del" k): one native call, one WAL write
+; zero-padded decimal, cheap (ru:pad loops in Aura)
+(define (nd-pad4 n) (substring (number->string (+ 10000 n)) 1 5))
+(define (nd-pad6 n) (substring (number->string (+ 1000000 n)) 1 7))
+(define (nd-rec op)
+  (if (equal? (car op) "put")
+      (let ((k (car (cdr op))) (v (car (cdr (cdr op)))))
+        (string-append "P" (nd-pad4 (string-length k)) (nd-pad6 (string-length v)) k v))
+      (let ((k (car (cdr op)))) (string-append "D" (nd-pad4 (string-length k)) k))))
+(define (ndb:write! d ops)
+  (let ((b (ru:concat (map nd-rec ops))))
+    (nd-check d ((nd-f d "write") (vector-ref d 1) b (string-length b)) "write")))
+; list of value-or-#f, one native call
+(define (ndb:multi-get d keys)
+  (let* ((b (ru:concat (map (lambda (k) (string-append (nd-pad4 (string-length k)) k)) keys)))
+         (r ((nd-f d "mget") (vector-ref d 1) b (string-length b))))
+    (if (not (string? r)) (list)
+        (if (and (> (string-length r) 0) (equal? (string-ref r 0) 33)) (ru:fail "ndb:multi-get: " r)
+            (let loop ((i 0) (acc (list)))
+              (if (>= i (string-length r)) (ru:rev acc)
+                  (if (equal? (string-ref r i) 78)   ; "N"
+                      (loop (+ i 1) (cons #f acc))
+                      (let ((vl (string->number (substring r (+ i 1) (+ i 7)))))
+                        (loop (+ i 7 vl) (cons (substring r (+ i 7) (+ i 7 vl)) acc))))))))))
+
+; live (key . val) with start <= key < end (#f: unbounded), at most limit (#f: all)
+(define (nd-decode c acc n limit)
+  (let loop ((i 0) (acc acc) (n n))
+    (if (or (>= i (string-length c)) (and limit (>= n limit))) (cons acc n)
+        (let* ((kl (string->number (substring c i (+ i 4)))) (vl (string->number (substring c (+ i 4) (+ i 10))))
+               (k0 (+ i 10)) (v0 (+ k0 kl)))
+          (loop (+ v0 vl) (cons (cons (substring c k0 v0) (substring c v0 (+ v0 vl))) acc) (+ n 1))))))
+(define (ndb:scan d start end limit)
+  (let* ((s (if start start "")) (e (if end end ""))
+         (se (string-append s e))
+         (it (nd-check d ((nd-f d "iter") (vector-ref d 1) se (string-length se) (string-length s)) "scan"))
+         (chunk (if limit (ru:min limit 256) 256)))
+    (let loop ((acc (list)) (n 0))
+      (let ((c ((nd-f d "iter-next") it chunk)))
+        (cond ((not (string? c)) (ru:fail "ndb:scan: no chunk"))
+              ((and (> (string-length c) 0) (equal? (string-ref c 0) 33)) ((nd-f d "iter-close") it) (ru:fail "ndb:scan: " c))
+              ((or (= (string-length c) 0) (and limit (>= n limit))) ((nd-f d "iter-close") it) (ru:rev acc))
+              (else (let ((r (nd-decode c acc n limit))) (loop (car r) (cdr r)))))))))
+
+(define (ndb:flush! d) (nd-check d ((nd-f d "flush") (vector-ref d 1)) "flush") #t)
+(define (ndb:compact! d) (nd-check d ((nd-f d "compact") (vector-ref d 1)) "compact") #t)
+; control plane: "k=v;..." or an alist; "now=1;" first applies a memtable rep at once
+(define (ndb:set! d opts)
+  (let ((s (ndb:opts->string opts)))
+    (nd-check d ((nd-f d "set") (vector-ref d 1) s (string-length s)) "set")
+    ; remembered for a reopen (implementation swap); "now=1;" is not an open option
+    (vector-set! d 3 (string-append (vector-ref d 3) (if (and (>= (string-length s) 6) (equal? (substring s 0 6) "now=1;")) (substring s 6 (string-length s)) s))) #t))
+(define (ndb:stat d name) ((nd-f d "stat") (vector-ref d 1) name (string-length name)))
+(define (ndb:check d) ((nd-f d "check") (vector-ref d 1)))
+; alist of every counter / state ("name" . number-or-string): one native call
+(define (nd-split s ch)
+  (let loop ((i 0) (st 0) (acc (list)))
+    (cond ((>= i (string-length s)) (ru:rev (if (> i st) (cons (substring s st i) acc) acc)))
+          ((equal? (string-ref s i) ch) (loop (+ i 1) (+ i 1) (cons (substring s st i) acc)))
+          (else (loop (+ i 1) st acc)))))
+(define (nd-kv s)
+  (map (lambda (p) (let ((kv (nd-split p 61))) (let ((n (string->number (car (cdr kv))))) (cons (car kv) (if n n (car (cdr kv)))))))
+       (nd-split s 59)))
+(define (ndb:stats d) (nd-kv ((nd-f d "stats") (vector-ref d 1))))
+; one call per control window: window features + EWMA (alpha permille) +
+; change score, computed natively from counter deltas; mark? sets the
+; change-detector reference
+(define (ndb:sample d alpha-pm mark?) (nd-kv ((vector-ref (vector-ref d 4) 21) (vector-ref d 1) alpha-pm (if mark? 1 0))))
+; the same as a vector of numbers (fixed-width decode, no k=v split; spec 24).
+; index: 0 ops 1 write 2 read 3 scan 4 miss 5 ns/op 6 fg ns/op 7 cache hit
+; 8-12 EWMA write read scan miss ns 13 change 14 flushes 15 compactions
+; 16 runs 17 l0 18 rep 19 rep-next 20 style 21 cache policy 22 cache blocks
+; 23 impl version 24 sampled ops 25 sampled blocks
+(define ndb:sample-fields 26)
+(define (ndb:sample-v d alpha-pm mark?)
+  (let ((s ((vector-ref (vector-ref d 4) 24) (vector-ref d 1) alpha-pm (if mark? 1 0))) (v (make-vector 26 0)))
+    (let loop ((i 0)) (if (< i 26) (begin (vector-set! v i (string->number (substring s (* 14 i) (+ 14 (* 14 i))))) (loop (+ i 1))) v))))
+(define (ndb:mark! d) ((vector-ref (vector-ref d 4) 21) (vector-ref d 1) 0 2) #t)
+; background simulation on the sampled rings (native thread): kind 1 memtable
+; replay, 2 block cache at cap blocks; #t started, #f busy / no samples
+(define (ndb:sim-start! d kind cap) (>= ((vector-ref (vector-ref d 4) 22) (vector-ref d 1) kind cap) 0))
+; #f still running | alist of the result
+(define (ndb:sim-poll d) (let ((r ((vector-ref (vector-ref d 4) 23) (vector-ref d 1)))) (if (and (string? r) (> (string-length r) 0)) (nd-kv r) #f)))
+; native workload driver: spec "op=fillseq;n=2000;value=100;seed=1" -> alist ns / ops / found
+(define (ndb:bench d spec)
+  (let ((r ((nd-f d "bench") (vector-ref d 1) spec (string-length spec))))
+    (if (and (string? r) (> (string-length r) 0) (not (equal? (string-ref r 0) 33))) (nd-kv r) (ru:fail "ndb:bench: " r))))
