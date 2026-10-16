@@ -15,6 +15,7 @@
 (require "nmod" all:)
 (require "nctl" all:)
 (hot:load!)   ; top-level statement: see lib/hot.aura
+(display "RUN-ONCE") (newline)
 (define (check name ok) (expect name ok))
 (define DIR (string-append (ru:root) "/build/test-nctl-" (number->string (current-time-ms))))
 (define TRAJ (string-append DIR ".jsonl"))
