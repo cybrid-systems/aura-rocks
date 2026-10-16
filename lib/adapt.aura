@@ -61,8 +61,8 @@
         (cons "mem_min_speedup" 1.15)  ; shadow replay gate
         (cons "cmp_write_hi" 0.7)      ; write share at or above: tiered compaction
         (cons "cmp_read_hi" 0.5)       ; read+scan share at or above: leveled compaction
-        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 4) (cons "max_runs" 4)
-        (cons "collapse_on_leveled" 0) ; 1: a switch tiered -> leveled merges all runs at once
+        (cons "l0_trigger_write" 8) (cons "l0_trigger_read" 2) (cons "max_runs" 4)
+        (cons "collapse_on_leveled" 1) ; 1: a switch tiered -> leveled merges all runs at once
         (cons "max_regress" 1.15)      ; post check: cost after / before above this -> rollback
         (cons "similar" 0.2)           ; post check only when the op mix moved less than this
         (cons "cooldown" 2)            ; decision points to wait after a rollback / reject
@@ -279,8 +279,8 @@
              (adapt:set-knob! "max_runs" (ap ctl "max_runs"))
              (adapt-row! ctl "compaction_style" cur cand "SWAP" "policy" 1.0 fs (list (cons "l0_trigger_from" old-trig) (cons "l0_trigger_to" trig)))
              ; leaving tiered: optionally collapse the sorted runs once (read amp back to 1 run)
-             ; (off by default: on a short read phase the one-off merge costs more
-             ; than the extra run probes it saves; the next L0 compaction merges anyway)
+             ; (on by default: bench_adapt with it off, l0_trigger_read 4, was faster in
+             ; the read phase but slower overall, 39.8 vs 37.0 ms/op; docs/adaptive.md)
              (if (and (equal? cand "leveled") (= 1 (ap ctl "collapse_on_leveled"))) (db:compact! db) #f)
              (add-pending! ctl "compaction_style" cur cand fs (list (cons "l0_trigger" old-trig)) (ap ctl "cmp_periods")))))))
 
