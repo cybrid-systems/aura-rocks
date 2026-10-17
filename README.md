@@ -197,7 +197,7 @@ Using it from Aura:
 - **aura#4546**: `(define x (f))` is silently left unbound when `f` runs `set-code` + `eval-current` of a source with a letrec loop. Repro: `probes/aura4546.aura`.
 - **aura#4547**: if the workspace is loaded while a module is loading, later `mutate:rebind`/heal makes module code call a different global, silently or with `invalid closure`. Repro: `probes/aura4547/`.
 - Workaround for both: `(hot:load!)` must run as a top-level statement of the main program. `db:open` refuses to run otherwise, and `tests/test_leaf.aura` checks that every rebind and heal reaches the right leaf.
-- **aura#4548**: `string-ref`/`substring` cost grows with the index even on ASCII strings. A random read on a 270 KB SSTable took more than 350 ms per get, until `sst:open` was changed to cut the file into per-block strings (the WAL is now cut per record too). Repro: `probes/string_ref_cost.aura`.
+- aura#4548 (`string-ref`/`substring` cost grew with the index even on ASCII strings; a random read on a 270 KB SSTable took more than 350 ms per get) is fixed in Aura fc85608c4. `sst:open` no longer cuts the file into per-block strings, and the WAL replay no longer cuts each record out. Repro: `probes/string_ref_cost.aura`.
 - aura#4549 (`sort`/`list-sort` returned `()` for strings and truncated floats) is fixed in Aura 602c648d3. `ru:sort-idx` now uses native `list-sort` with a comparator, and the hand-written merge sort is gone. Repro: `probes/sort_nonint.aura`.
 - aura#4537 (list corruption after about 100 workspace calls) reproduced on 542fb9254 and is fixed on 89cbd6c2b (the earlier pin; now fc85608c4 for aura#4549).
 - **aura#4550**: after a few `mutate:rebind` + `eval-current`, a caller of a rebound define throws "eval_flat: invalid closure". This is why kernels go into host slots instead of being rebound.
@@ -215,6 +215,7 @@ Using it from Aura:
 - Pure Soft mode (no kernels) is 10–40% slower than before the coarse kernels.
 - Running the full gated policy inside a process leaves it slower afterwards. The rk-sst-merge Soft reference alone takes about 180 s on the sample. Install a known KEEP set with `BENCH_KEEP` / `rsink:install-only!`.
 - The test_adapt and test_cache gates are timing-based and can flip under heavy machine load.
+- **aura#4595**: after a top-level named let, a closure created in a later top-level `let` resolves a let-bound name that shadows a global to the global. `tests/test_kernels.aura` names its corrupted input `corrupt` (not `bad`, a global counter) for this reason.
 - No snapshots. Two levels only (L0, L1). ASCII-only keys and values. Single-threaded; compaction runs inline.
 
 License: Apache-2.0.

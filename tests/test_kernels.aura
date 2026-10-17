@@ -91,9 +91,11 @@
   (sst:write (ru:path d "b.sst") es 512 10)
   (expect "sst:write kernel == module path" (equal? (rio:read (ru:path d "a.sst")) (rio:read (ru:path d "b.sst")))))
 ; a corrupted block: the kernel refuses, the Aura define reports corruption
-(let* ((f (rfile (rkeys 30) 256 10)) (bad (string-append (substring f 0 20) (if (equal? (substring f 20 21) "x") "y" "x") (substring f 21 (string-length f)))))
-  (expect "merge: corrupted input refused by the kernel" (not (leaf:sst-merge-k bad 1 1000 256 10)))
-  (expect "merge: corrupted input -> corruption error" (equal? (sv (lambda () (rk-sst-merge bad 1 1000 256 10))) "error")))
+; (named corrupt, not bad: a closure in a top-level let after the named-let
+; loops above would see the global bad counter instead, aura#4595)
+(let* ((f (rfile (rkeys 30) 256 10)) (corrupt (string-append (substring f 0 20) (if (equal? (substring f 20 21) "x") "y" "x") (substring f 21 (string-length f)))))
+  (expect "merge: corrupted input refused by the kernel" (not (leaf:sst-merge-k corrupt 1 1000 256 10)))
+  (expect "merge: corrupted input -> corruption error" (equal? (sv (lambda () (rk-sst-merge corrupt 1 1000 256 10))) "error")))
 ; edge cases (refusals fall back to the Aura define, including its errors)
 (define (edge tag th1 th2) (expect (string-append "edge " tag) (equal? (sv th1) (sv th2))))
 (edge "checksum empty range" (lambda () (leaf:checksum "abc" 2 1)) (lambda () (rk-checksum "abc" 2 1)))

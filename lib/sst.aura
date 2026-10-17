@@ -12,7 +12,7 @@
 ; mmap) and verifies a data block's checksum each time it reads the block
 ; (no block cache in the MVP).
 ;
-; t  = #(path raws idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size uid data)
+; t  = #(path data idx-keys idx-offs idx-sizes nblocks bloom smallest largest count size uid data)
 ;
 ; Optional process-wide block cache (lib/cache.aura, sst:set-cache!): a
 ; verified block is cached under "<uid>#<block>", uid unique per opened table,
@@ -80,47 +80,41 @@
         (let* ((e (car es)) (enc (entry:encode (car e) (car (cdr e)) (car (cdr (cdr e))))))
           (loop (cdr es) (cons enc cur) (+ cur-bytes (string-length enc) 6) (car (cdr e)) off pieces index (cons (car (cdr e)) keys) (+ count 1) (cons (string-append (substring enc 1 5) (car (cdr e))) kb))))))
 
-; string-ref/substring cost grows with the index even on ASCII strings
-; (aura#4548), so open cuts the file once into the footer, index, filter and
-; one string per block (each with its trailing checksum); every later index is
-; below the block size.
-(define (sst-check-str! s what path)
-  (let ((len (string-length s)))
-    (if (< len 10) (ru:fail "corruption: short " what " in " path) #f)
-    (if (= (leaf:dec s (- len 10) 10) (leaf:checksum s 0 (- len 10))) #t
-        (ru:fail "corruption: " what " checksum mismatch in " path))))
+(define (sst-check! data start len what path)
+  (if (< len 10) (ru:fail "corruption: short " what " in " path) #f)
+  (if (= (leaf:dec data (+ start len -10) 10) (leaf:checksum data start (+ start len -10))) #t
+      (ru:fail "corruption: " what " checksum mismatch in " path)))
 
+; Every read indexes the file string directly: string-ref / substring are
+; O(1) in the index since aura#4548 (Aura fc85608c4), so open no longer cuts
+; the file into per-block strings.
 (define (sst:open path)
   (let ((data (rio:read path)))
     (if (not data) (ru:fail "cannot read " path) #f)
     (let ((n (string-length data)))
-      (if (< n sst-footer-size) (ru:fail "corruption: bad footer in " path) #f)
-      (let ((ft (substring data (- n sst-footer-size) n)))
-        (if (not (string=? (substring ft (- sst-footer-size 8) sst-footer-size) sst-magic))
-            (ru:fail "corruption: bad footer in " path) #f)
-        (let* ((idx-off (leaf:dec ft 0 12)) (idx-size (leaf:dec ft 12 12))
-               (flt-off (leaf:dec ft 24 12)) (flt-size (leaf:dec ft 36 12))
-               (count (leaf:dec ft 48 12))
-               (ix (substring data idx-off (+ idx-off idx-size)))
-               (fl (substring data flt-off (+ flt-off flt-size))))
-          (sst-check-str! ix "index" path)
-          (sst-check-str! fl "filter" path)
-          (let* ((sl (leaf:dec ix 0 4)) (smallest (substring ix 4 (+ 4 sl)))
-                 (p2 (+ 4 sl)) (ll (leaf:dec ix p2 4)) (largest (substring ix (+ p2 4) (+ p2 4 ll)))
-                 (p3 (+ p2 4 ll)) (nb (leaf:dec ix p3 8))
-                 (keys (make-vector nb "")) (offs (make-vector nb 0)) (sizes (make-vector nb 0))
-                 (raws (make-vector nb "")))
-            (let each ((i 0) (q (+ p3 8)))
-              (if (< i nb)
-                  (let* ((kl (leaf:dec ix q 4)) (off (leaf:dec ix (+ q 4 kl) 12)) (size (leaf:dec ix (+ q 16 kl) 8)))
-                    (vector-set! keys i (substring ix (+ q 4) (+ q 4 kl)))
-                    (vector-set! offs i off)
-                    (vector-set! sizes i size)
-                    (vector-set! raws i (substring data off (+ off size)))
-                    (each (+ i 1) (+ q 24 kl)))
-                  #t))
-            (vector path raws keys offs sizes nb (bloom:parse (substring fl 0 (- flt-size 10)))
-                    smallest largest count n (sst-next-uid!) data)))))))
+      (if (or (< n sst-footer-size) (not (string=? (substring data (- n 8) n) sst-magic)))
+          (ru:fail "corruption: bad footer in " path) #f)
+      (let* ((f (- n sst-footer-size))
+             (idx-off (leaf:dec data f 12)) (idx-size (leaf:dec data (+ f 12) 12))
+             (flt-off (leaf:dec data (+ f 24) 12)) (flt-size (leaf:dec data (+ f 36) 12))
+             (count (leaf:dec data (+ f 48) 12)))
+        (sst-check! data idx-off idx-size "index" path)
+        (sst-check! data flt-off flt-size "filter" path)
+        (let* ((p idx-off)
+               (sl (leaf:dec data p 4)) (smallest (substring data (+ p 4) (+ p 4 sl)))
+               (p2 (+ p 4 sl)) (ll (leaf:dec data p2 4)) (largest (substring data (+ p2 4) (+ p2 4 ll)))
+               (p3 (+ p2 4 ll)) (nb (leaf:dec data p3 8))
+               (keys (make-vector nb "")) (offs (make-vector nb 0)) (sizes (make-vector nb 0)))
+          (let each ((i 0) (q (+ p3 8)))
+            (if (< i nb)
+                (let ((kl (leaf:dec data q 4)))
+                  (vector-set! keys i (substring data (+ q 4) (+ q 4 kl)))
+                  (vector-set! offs i (leaf:dec data (+ q 4 kl) 12))
+                  (vector-set! sizes i (leaf:dec data (+ q 16 kl) 8))
+                  (each (+ i 1) (+ q 24 kl)))
+                #t))
+          (vector path data keys offs sizes nb (bloom:parse (substring data flt-off (+ flt-off flt-size -10)))
+                  smallest largest count n (sst-next-uid!) data))))))
 
 (define (sst:path t) (vector-ref t 0))
 (define (sst:nblocks t) (vector-ref t 5))
@@ -141,10 +135,10 @@
 
 ; verified block content (without its checksum)
 (define (sst-block-read t i)
-  (let ((raw (vector-ref (vector-ref t 1) i)))
+  (let ((data (vector-ref t 1)) (off (vector-ref (vector-ref t 3) i)) (size (vector-ref (vector-ref t 4) i)))
     (sst-bump! 2)
-    (sst-check-str! raw "block" (vector-ref t 0))
-    (substring raw 0 (- (string-length raw) 10))))
+    (sst-check! data off size "block" (vector-ref t 0))
+    (substring data off (+ off size -10))))
 (define (sst-block t i)
   (let ((c (vector-ref sst-cache-box 0)))
     (if (not c) (sst-block-read t i)

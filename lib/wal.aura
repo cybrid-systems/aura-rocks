@@ -28,10 +28,8 @@
             (if (or (> (+ off 19) n) (not (= (string-ref s off) 82)) (not (wal-digits? s (+ off 1) 18)))
                 (list count off n)
                 (let* ((len (leaf:dec s (+ off 1) 8)) (ck (leaf:dec s (+ off 9) 10)) (p (+ off 19)))
-                  ; record cut out once: indexing deep into s is O(offset) (aura#4548)
-                  (let ((r (if (> (+ p len) n) "" (substring s p (+ p len)))))
-                    (if (or (> (+ p len) n) (< len 11) (not (= ck (leaf:checksum r 0 len))))
-                        (list count off n)
-                        (begin
-                          (apply! (entry:type-at r 0) (entry:key-at r 0) (entry:val-at r 0))
-                          (loop (+ p len) (+ count 1))))))))))))
+                  (if (or (> (+ p len) n) (< len 11) (not (= ck (leaf:checksum s p (+ p len)))))
+                      (list count off n)
+                      (begin
+                        (apply! (entry:type-at s p) (entry:key-at s p) (entry:val-at s p))
+                        (loop (+ p len) (+ count 1)))))))))))
