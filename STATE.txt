@@ -1,6 +1,6 @@
 # aura-rocks state (machine-readable, key=value)
 aura_repo=https://github.com/cybrid-systems/aura
-aura_tip=89cbd6c2b   # main 2026-10-16; needed for aura#4537 (list corruption after ~100 workspace calls, reproduced on 542fb9254) and #4531/#4532
+aura_tip=fc85608c4   # main 2026-10-17; needs aura#4549 (602c648d3: list-sort comparator, used by ru:sort-idx); earlier floor 89cbd6c2b for aura#4537 #4531 #4532
 aura_face=soft       # AURA_SANDBOX=off AURA_PIPELINE_STRICT=0, image ghcr.io/cybrid-systems/dev:v1.0.9
 kernel_sink=third_party/aura-kernel-sink @ 3bdab5f (csink host slots: policy:sink-host!; c-func <= 6 args)
 wal=real             # lib/wal.aura: "R" len(8) adler32(10) payload; O_APPEND via kernels/rocks_io.c (pure read+rewrite fallback, ROCKS_PURE_IO=1); replay stops at first torn/corrupt record

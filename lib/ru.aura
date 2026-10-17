@@ -29,22 +29,9 @@
     (let loop ((i 0)) (cond ((>= i n) #t) ((> (string-ref s i) 127) #f) (else (loop (+ i 1)))))))
 
 ; Indices 0..n-1 of the string vector keys, sorted by key, stable (equal keys
-; keep insertion order). Bottom-up merge sort: std/list sort silently returns
-; () for a list of strings (aura#4549).
-(define (ru-merge! keys src dst lo mid hi)
-  (let loop ((i lo) (j mid) (k lo))
-    (cond ((>= k hi) #t)
-          ((and (< j hi) (or (>= i mid) (string<? (vector-ref keys (vector-ref src j)) (vector-ref keys (vector-ref src i)))))
-           (vector-set! dst k (vector-ref src j)) (loop i (+ j 1) (+ k 1)))
-          (else (vector-set! dst k (vector-ref src i)) (loop (+ i 1) j (+ k 1))))))
+; keep insertion order). Native list-sort with a comparator (stable merge,
+; aura#4549 fixed in 602c648d3); the hand-written merge sort is gone.
 (define (ru:sort-idx keys n)
-  (let ((a (make-vector n 0)) (b (make-vector n 0)))
-    (let fill ((i 0)) (if (< i n) (begin (vector-set! a i i) (fill (+ i 1))) #t))
-    (let pass ((w 1) (src a) (dst b))
-      (if (>= w n) src
-          (begin
-            (let run ((lo 0))
-              (if (< lo n)
-                  (begin (ru-merge! keys src dst lo (ru:min (+ lo w) n) (ru:min (+ lo (* 2 w)) n)) (run (+ lo (* 2 w))))
-                  #t))
-            (pass (* 2 w) dst src))))))
+  (let ((ids (let loop ((i (- n 1)) (acc (list))) (if (< i 0) acc (loop (- i 1) (cons i acc))))))
+    (list->vector
+     (list-sort ids (lambda (i j) (string<? (vector-ref keys i) (vector-ref keys j)))))))

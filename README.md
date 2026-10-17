@@ -172,7 +172,7 @@ Details and the remaining gaps are in [docs/adaptive.md](docs/adaptive.md).
 
 ```sh
 git clone --recursive https://github.com/cybrid-systems/aura-rocks && cd aura-rocks
-# Aura 89cbd6c2b or newer (see STATE.txt), built with cmake; run in ghcr.io/cybrid-systems/dev:v1.0.9
+# Aura fc85608c4 or newer (see STATE.txt), built with cmake; run in ghcr.io/cybrid-systems/dev:v1.0.9
 export AURA_BIN=~/aura/build-rel/aura
 scripts/run_tests.sh                       # unit, sstable, db (randomized vs oracle, recovery, torn WAL), leaf rebind guard
 . scripts/env.sh && kernels/build_io.sh    # librocks_io.so (run_tests does this too)
@@ -198,8 +198,8 @@ Using it from Aura:
 - **aura#4547**: if the workspace is loaded while a module is loading, later `mutate:rebind`/heal makes module code call a different global, silently or with `invalid closure`. Repro: `probes/aura4547/`.
 - Workaround for both: `(hot:load!)` must run as a top-level statement of the main program. `db:open` refuses to run otherwise, and `tests/test_leaf.aura` checks that every rebind and heal reaches the right leaf.
 - **aura#4548**: `string-ref`/`substring` cost grows with the index even on ASCII strings. A random read on a 270 KB SSTable took more than 350 ms per get, until `sst:open` was changed to cut the file into per-block strings (the WAL is now cut per record too). Repro: `probes/string_ref_cost.aura`.
-- **aura#4549**: `sort`/`list-sort` silently return `()` for a list of strings and truncate floats. The memtable vector rep sorts with its own merge sort (`ru:sort-idx`). Repro: `probes/sort_nonint.aura`.
-- aura#4537 (list corruption after about 100 workspace calls) reproduced on 542fb9254 and is fixed on 89cbd6c2b. That is why the pin is 89cbd6c2b.
+- aura#4549 (`sort`/`list-sort` returned `()` for strings and truncated floats) is fixed in Aura 602c648d3. `ru:sort-idx` now uses native `list-sort` with a comparator, and the hand-written merge sort is gone. Repro: `probes/sort_nonint.aura`.
+- aura#4537 (list corruption after about 100 workspace calls) reproduced on 542fb9254 and is fixed on 89cbd6c2b (the earlier pin; now fc85608c4 for aura#4549).
 - **aura#4550**: after a few `mutate:rebind` + `eval-current`, a caller of a rebound define throws "eval_flat: invalid closure". This is why kernels go into host slots instead of being rebound.
 - **aura#4551**: `c-func` does not check argument types. A String passed to an Int slot sends garbage; an Int passed to a String slot crashes with SIGSEGV. Entry points guard every String parameter with `string?`.
 - **aura#4552**: in a workspace (`eval-current`) define, an `(error ...)` that is not in tail position is silently dropped, and a callee's error flows on as an Error value. Reference defines raise only in tail position.
