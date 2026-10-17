@@ -215,6 +215,7 @@ Using it from Aura:
 - Pure Soft mode (no kernels) is 10–40% slower than before the coarse kernels.
 - Running the full gated policy inside a process leaves it slower afterwards. The rk-sst-merge Soft reference alone takes about 180 s on the sample. Install a known KEEP set with `BENCH_KEEP` / `rsink:install-only!`.
 - The test_adapt and test_cache gates are timing-based and can flip under heavy machine load.
+- Known rocks-side failure: `tests/test_adapt.aura` "read phase: switched live to hash" and "post check rolled a swap back". The vector→hash memtable gate rejects every candidate: shadow-replay speedup 0.48–0.87 against `mem_min_speedup` 1.15. It fails the same way on an idle machine and on every Aura pin tried (the old pin, f242d3cbd, fc85608c4), and Aura `hash-ref` is not slow (about 5 µs above loop overhead, against about 124 µs for a 300-entry binary search). The cause is the hash rep cost in replay (a skiplist per bucket), not Aura. The threshold is unchanged for now.
 - **aura#4595**: after a top-level named let, a closure created in a later top-level `let` resolves a let-bound name that shadows a global to the global. `tests/test_kernels.aura` names its corrupted input `corrupt` (not `bad`, a global counter) for this reason.
 - No snapshots. Two levels only (L0, L1). ASCII-only keys and values. Single-threaded; compaction runs inline.
 
